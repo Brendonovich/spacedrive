@@ -8,12 +8,13 @@
 
 use crate::{
 	invalidate_query, library::Library, location::manager::LocationManagerError, prisma::location,
-	util::error::FileIOError,
+	util::error::FileIOError, Node,
 };
 
 use std::{
 	collections::{BTreeMap, HashMap},
 	path::PathBuf,
+	sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -32,7 +33,8 @@ use super::{
 #[derive(Debug)]
 pub(super) struct LinuxEventHandler<'lib> {
 	location_id: location::id::Type,
-	library: &'lib Library,
+	library: &'lib Arc<Library>,
+	node: &'lib Arc<Node>,
 	last_check_rename: Instant,
 	rename_from: HashMap<PathBuf, Instant>,
 	rename_from_buffer: Vec<(PathBuf, Instant)>,
@@ -42,10 +44,15 @@ pub(super) struct LinuxEventHandler<'lib> {
 
 #[async_trait]
 impl<'lib> EventHandler<'lib> for LinuxEventHandler<'lib> {
-	fn new(location_id: location::id::Type, library: &'lib Library) -> Self {
+	fn new(
+		location_id: location::id::Type,
+		library: &'lib Arc<Library>,
+		node: &'lib Arc<Node>,
+	) -> Self {
 		Self {
 			location_id,
 			library,
+			node,
 			last_check_rename: Instant::now(),
 			rename_from: HashMap::new(),
 			rename_from_buffer: Vec::new(),
@@ -70,6 +77,7 @@ impl<'lib> EventHandler<'lib> for LinuxEventHandler<'lib> {
 					&fs::metadata(path)
 						.await
 						.map_err(|e| FileIOError::from((path, e)))?,
+					self.node,
 					self.library,
 				)
 				.await?;
@@ -80,7 +88,7 @@ impl<'lib> EventHandler<'lib> for LinuxEventHandler<'lib> {
 			EventKind::Modify(ModifyKind::Data(DataChange::Any)) => {
 				// If a file was closed with write mode, then it was updated or created
 				if !self.recently_created_files.contains_key(&paths[0]) {
-					update_file(self.location_id, &paths[0], self.library).await?;
+					update_file(self.location_id, &paths[0], self.node, self.library).await?;
 				}
 			}
 			EventKind::Create(CreateKind::Folder) => {
@@ -92,6 +100,7 @@ impl<'lib> EventHandler<'lib> for LinuxEventHandler<'lib> {
 					&fs::metadata(path)
 						.await
 						.map_err(|e| FileIOError::from((path, e)))?,
+					self.node,
 					self.library,
 				)
 				.await?;

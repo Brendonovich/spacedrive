@@ -8,20 +8,23 @@ use crate::{
 		preview::{shallow_thumbnailer, thumbnailer_job::ThumbnailerJobInit},
 	},
 	prisma::{file_path, indexer_rules_in_location, location, PrismaClient},
-	sync,
-	util::{db::chain_optional_iter, error::FileIOError},
+	util::error::FileIOError,
+	Node,
 };
 
 use std::{
 	collections::HashSet,
 	path::{Component, Path, PathBuf},
+	sync::Arc,
 };
 
 use chrono::Utc;
 use futures::future::TryFutureExt;
 use normpath::PathExt;
 use prisma_client_rust::{operator::and, or, QueryError};
+use sd_prisma::prisma_sync;
 use sd_sync::*;
+use sd_utils::uuid_to_bytes;
 use serde::Deserialize;
 use serde_json::json;
 use specta::Type;
@@ -37,7 +40,7 @@ mod metadata;
 
 pub use error::LocationError;
 use indexer::IndexerJobInit;
-pub use manager::{LocationManager, LocationManagerError};
+pub use manager::{LocationManagerError, Locations};
 use metadata::SpacedriveLocationMetadataFile;
 
 use file_path_helper::IsolatedFilePathData;
@@ -60,7 +63,8 @@ pub struct LocationCreateArgs {
 impl LocationCreateArgs {
 	pub async fn create(
 		self,
-		library: &Library,
+		node: &Node,
+		library: &Arc<Library>,
 	) -> Result<Option<location_with_indexer_rules::Data>, LocationError> {
 		let path_metadata = match fs::metadata(&self.path).await {
 			Ok(metadata) => metadata,
@@ -124,14 +128,14 @@ impl LocationCreateArgs {
 			)
 			.err_into::<LocationError>()
 			.and_then(|()| async move {
-				Ok(library
-					.location_manager()
+				Ok(node
+					.locations
 					.add(location.data.id, library.clone())
 					.await?)
 			})
 			.await
 			{
-				delete_location(library, location.data.id).await?;
+				delete_location(node, library, location.data.id).await?;
 				Err(err)?;
 			}
 
@@ -145,7 +149,8 @@ impl LocationCreateArgs {
 
 	pub async fn add_library(
 		self,
-		library: &Library,
+		node: &Node,
+		library: &Arc<Library>,
 	) -> Result<Option<location_with_indexer_rules::Data>, LocationError> {
 		let mut metadata = SpacedriveLocationMetadataFile::try_load(&self.path)
 			.await?
@@ -189,8 +194,7 @@ impl LocationCreateArgs {
 				.add_library(library.id, uuid, &self.path, location.name)
 				.await?;
 
-			library
-				.location_manager()
+			node.locations
 				.add(location.data.id, library.clone())
 				.await?;
 
@@ -223,8 +227,8 @@ pub struct LocationUpdateArgs {
 }
 
 impl LocationUpdateArgs {
-	pub async fn update(self, library: &Library) -> Result<(), LocationError> {
-		let Library { sync, db, .. } = &library;
+	pub async fn update(self, library: &Arc<Library>) -> Result<(), LocationError> {
+		let Library { sync, db, .. } = &**library;
 
 		let location = find_location(library, self.id)
 			.include(location_with_indexer_rules::include())
@@ -273,7 +277,7 @@ impl LocationUpdateArgs {
 						.into_iter()
 						.map(|p| {
 							sync.shared_update(
-								sync::location::SyncId {
+								prisma_sync::location::SyncId {
 									pub_id: location.pub_id.clone(),
 								},
 								p.0,
@@ -341,10 +345,13 @@ impl LocationUpdateArgs {
 }
 
 pub fn find_location(
-	Library { db, .. }: &Library,
+	library: &Library,
 	location_id: location::id::Type,
 ) -> location::FindUniqueQuery {
-	db.location().find_unique(location::id::equals(location_id))
+	library
+		.db
+		.location()
+		.find_unique(location::id::equals(location_id))
 }
 
 async fn link_location_and_indexer_rules(
@@ -368,7 +375,8 @@ async fn link_location_and_indexer_rules(
 }
 
 pub async fn scan_location(
-	library: &Library,
+	node: &Arc<Node>,
+	library: &Arc<Library>,
 	location: location_with_indexer_rules::Data,
 ) -> Result<(), JobManagerError> {
 	// TODO(N): This isn't gonna work with removable media and this will likely permanently break if the DB is restored from a backup.
@@ -393,14 +401,14 @@ pub async fn scan_location(
 		location: location_base_data,
 		sub_path: None,
 	})
-	.spawn(library)
+	.spawn(node, library)
 	.await
 	.map_err(Into::into)
 }
 
-#[cfg(feature = "location-watcher")]
 pub async fn scan_location_sub_path(
-	library: &Library,
+	node: &Arc<Node>,
+	library: &Arc<Library>,
 	location: location_with_indexer_rules::Data,
 	sub_path: impl AsRef<Path>,
 ) -> Result<(), JobManagerError> {
@@ -431,13 +439,14 @@ pub async fn scan_location_sub_path(
 		location: location_base_data,
 		sub_path: Some(sub_path),
 	})
-	.spawn(library)
+	.spawn(node, library)
 	.await
 	.map_err(Into::into)
 }
 
 pub async fn light_scan_location(
-	library: Library,
+	node: Arc<Node>,
+	library: Arc<Library>,
 	location: location_with_indexer_rules::Data,
 	sub_path: impl AsRef<Path>,
 ) -> Result<(), JobError> {
@@ -450,18 +459,18 @@ pub async fn light_scan_location(
 
 	let location_base_data = location::Data::from(&location);
 
-	indexer::shallow(&location, &sub_path, &library).await?;
+	indexer::shallow(&location, &sub_path, &node, &library).await?;
 	file_identifier::shallow(&location_base_data, &sub_path, &library).await?;
-	shallow_thumbnailer(&location_base_data, &sub_path, &library).await?;
+	shallow_thumbnailer(&location_base_data, &sub_path, &library, &node).await?;
 
 	Ok(())
 }
 
 pub async fn relink_location(
-	library: &Library,
+	library: &Arc<Library>,
 	location_path: impl AsRef<Path>,
 ) -> Result<(), LocationError> {
-	let Library { db, id, sync, .. } = &library;
+	let Library { db, id, sync, .. } = &**library;
 
 	let mut metadata = SpacedriveLocationMetadataFile::try_load(&location_path)
 		.await?
@@ -479,7 +488,7 @@ pub async fn relink_location(
 	sync.write_op(
 		db,
 		sync.shared_update(
-			sync::location::SyncId {
+			prisma_sync::location::SyncId {
 				pub_id: pub_id.clone(),
 			},
 			location::path::NAME,
@@ -502,13 +511,13 @@ pub struct CreatedLocationResult {
 }
 
 async fn create_location(
-	library: &Library,
+	library: &Arc<Library>,
 	location_pub_id: Uuid,
 	location_path: impl AsRef<Path>,
 	indexer_rules_ids: &[i32],
 	dry_run: bool,
 ) -> Result<Option<CreatedLocationResult>, LocationError> {
-	let Library { db, sync, .. } = &library;
+	let Library { db, sync, .. } = &**library;
 
 	let mut path = location_path.as_ref().to_path_buf();
 
@@ -584,7 +593,7 @@ async fn create_location(
 			db,
 			(
 				sync.shared_create(
-					sync::location::SyncId {
+					prisma_sync::location::SyncId {
 						pub_id: location_pub_id.as_bytes().to_vec(),
 					},
 					[
@@ -592,10 +601,9 @@ async fn create_location(
 						(location::path::NAME, json!(&location_path)),
 						(location::date_created::NAME, json!(date_created)),
 						(
-							location::instance_id::NAME,
-							json!(sync::instance::SyncId {
-								pub_id: vec![],
-								// id: library.config.instance_id,
+							location::instance::NAME,
+							json!(prisma_sync::instance::SyncId {
+								pub_id: uuid_to_bytes(library.sync.instance)
 							}),
 						),
 					],
@@ -640,26 +648,25 @@ async fn create_location(
 }
 
 pub async fn delete_location(
-	library: &Library,
+	node: &Node,
+	library: &Arc<Library>,
 	location_id: location::id::Type,
 ) -> Result<(), LocationError> {
-	let Library { db, .. } = library;
-
-	library
-		.location_manager()
-		.remove(location_id, library.clone())
-		.await?;
+	node.locations.remove(location_id, library.clone()).await?;
 
 	delete_directory(library, location_id, None).await?;
 
-	db.indexer_rules_in_location()
+	library
+		.db
+		.indexer_rules_in_location()
 		.delete_many(vec![indexer_rules_in_location::location_id::equals(
 			location_id,
 		)])
 		.exec()
 		.await?;
 
-	let location = db
+	let location = library
+		.db
 		.location()
 		.delete(location::id::equals(location_id))
 		.exec()
@@ -692,7 +699,7 @@ pub async fn delete_directory(
 ) -> Result<(), QueryError> {
 	let Library { db, .. } = library;
 
-	let children_params = chain_optional_iter(
+	let children_params = sd_utils::chain_optional_iter(
 		[file_path::location_id::equals(Some(location_id))],
 		[parent_iso_file_path.and_then(|parent| {
 			parent
@@ -709,7 +716,7 @@ pub async fn delete_directory(
 	db.file_path().delete_many(children_params).exec().await?;
 
 	library.orphan_remover.invoke().await;
-	library.thumbnail_remover.invoke().await;
+
 	invalidate_query!(library, "search.paths");
 
 	Ok(())
@@ -732,7 +739,7 @@ impl From<location_with_indexer_rules::Data> for location::Data {
 			date_created: data.date_created,
 			file_paths: None,
 			indexer_rules: None,
-			// instance: None,
+			instance: None,
 		}
 	}
 }
@@ -754,7 +761,7 @@ impl From<&location_with_indexer_rules::Data> for location::Data {
 			date_created: data.date_created,
 			file_paths: None,
 			indexer_rules: None,
-			// instance: None,
+			instance: None,
 		}
 	}
 }

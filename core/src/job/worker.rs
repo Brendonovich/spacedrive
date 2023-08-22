@@ -1,4 +1,4 @@
-use crate::{api::CoreEvent, invalidate_query, library::Library};
+use crate::{api::CoreEvent, invalidate_query, library::Library, Node};
 
 use std::{
 	fmt,
@@ -22,7 +22,7 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use super::{
-	DynJob, JobError, JobManager, JobReport, JobReportUpdate, JobRunErrors, JobRunOutput, JobStatus,
+	DynJob, JobError, JobReport, JobReportUpdate, JobRunErrors, JobRunOutput, JobStatus, Jobs,
 };
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -51,7 +51,8 @@ pub enum WorkerCommand {
 }
 
 pub struct WorkerContext {
-	pub library: Library,
+	pub library: Arc<Library>,
+	pub node: Arc<Node>,
 	pub(super) events_tx: mpsc::UnboundedSender<WorkerEvent>,
 }
 
@@ -100,8 +101,9 @@ impl Worker {
 		id: Uuid,
 		mut job: Box<dyn DynJob>,
 		mut report: JobReport,
-		library: Library,
-		job_manager: Arc<JobManager>,
+		library: Arc<Library>,
+		node: Arc<Node>,
+		job_manager: Arc<Jobs>,
 	) -> Result<Self, JobError> {
 		let (commands_tx, commands_rx) = mpsc::channel(8);
 
@@ -142,6 +144,7 @@ impl Worker {
 			start_time,
 			commands_rx,
 			library,
+			node,
 		));
 
 		Ok(Self {
@@ -294,13 +297,15 @@ impl Worker {
 		report_watch_tx: Arc<watch::Sender<JobReport>>,
 		start_time: DateTime<Utc>,
 		commands_rx: mpsc::Receiver<WorkerCommand>,
-		library: Library,
+		library: Arc<Library>,
+		node: Arc<Node>,
 	) {
 		let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
 		let mut job_future = job.run(
 			WorkerContext {
 				library: library.clone(),
+				node: node.clone(),
 				events_tx,
 			},
 			commands_rx,
@@ -516,7 +521,7 @@ impl Worker {
 
 struct JobWorkTable {
 	job: Box<dyn DynJob>,
-	manager: Arc<JobManager>,
+	manager: Arc<Jobs>,
 	hash: u64,
 	report: JobReport,
 }

@@ -10,11 +10,14 @@ use crate::{
 		indexer::{execute_indexer_update_step, IndexerJobUpdateStep},
 		LocationError,
 	},
-	to_remove_db_fetcher_fn,
+	to_remove_db_fetcher_fn, Node,
 };
 use tracing::error;
 
-use std::path::{Path, PathBuf};
+use std::{
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use itertools::Itertools;
 
@@ -30,6 +33,7 @@ const BATCH_SIZE: usize = 1000;
 pub async fn shallow(
 	location: &location_with_indexer_rules::Data,
 	sub_path: &PathBuf,
+	node: &Arc<Node>,
 	library: &Library,
 ) -> Result<(), JobError> {
 	let location_id = location.id;
@@ -80,6 +84,15 @@ pub async fn shallow(
 		.await?
 	};
 
+	node.thumbnail_remover
+		.remove_cas_ids(
+			to_remove
+				.iter()
+				.filter_map(|file_path| file_path.cas_id.clone())
+				.collect::<Vec<_>>(),
+		)
+		.await;
+
 	errors.into_iter().for_each(|e| error!("{e}"));
 
 	// TODO pass these uuids to sync system
@@ -116,7 +129,6 @@ pub async fn shallow(
 	invalidate_query!(library, "search.paths");
 
 	library.orphan_remover.invoke().await;
-	library.thumbnail_remover.invoke().await;
 
 	Ok(())
 }

@@ -10,7 +10,6 @@ use crate::{
 	},
 	object::preview::get_thumb_key,
 	prisma::{self, file_path, location, object, tag, tag_on_object, PrismaClient},
-	util::db::chain_optional_iter,
 };
 
 use std::collections::BTreeSet;
@@ -36,8 +35,9 @@ struct OptionalRange<T> {
 	to: Option<T>,
 }
 
-#[derive(Deserialize, Type, Debug, Clone, Copy)]
-enum SortOrder {
+#[derive(Serialize, Deserialize, Type, Debug, Clone, Copy)]
+#[serde(rename_all = "PascalCase")]
+pub enum SortOrder {
 	Asc,
 	Desc,
 }
@@ -51,9 +51,9 @@ impl From<SortOrder> for prisma::SortOrder {
 	}
 }
 
-#[derive(Deserialize, Type, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-enum FilePathSearchOrdering {
+#[derive(Serialize, Deserialize, Type, Debug, Clone)]
+#[serde(rename_all = "camelCase", tag = "field", content = "value")]
+pub enum FilePathSearchOrdering {
 	Name(SortOrder),
 	SizeInBytes(SortOrder),
 	DateCreated(SortOrder),
@@ -159,7 +159,7 @@ impl FilePathFilterArgs {
 		{
 			use file_path::*;
 
-			Ok(chain_optional_iter(
+			Ok(sd_utils::chain_optional_iter(
 				self.search
 					.unwrap_or_default()
 					.split(' ')
@@ -184,16 +184,18 @@ impl FilePathFilterArgs {
 	}
 }
 
-#[derive(Deserialize, Type, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-enum ObjectSearchOrdering {
+#[derive(Serialize, Deserialize, Type, Debug, Clone)]
+#[serde(rename_all = "camelCase", tag = "field", content = "value")]
+pub enum ObjectSearchOrdering {
 	DateAccessed(SortOrder),
+	Kind(SortOrder),
 }
 
 impl ObjectSearchOrdering {
 	fn get_sort_order(&self) -> prisma::SortOrder {
 		(*match self {
 			Self::DateAccessed(v) => v,
+			Self::Kind(v) => v,
 		})
 		.into()
 	}
@@ -201,8 +203,10 @@ impl ObjectSearchOrdering {
 	fn into_param(self) -> object::OrderByWithRelationParam {
 		let dir = self.get_sort_order();
 		use object::*;
+
 		match self {
 			Self::DateAccessed(_) => date_accessed::order(dir),
+			Self::Kind(_) => kind::order(dir),
 		}
 	}
 }
@@ -248,7 +252,7 @@ impl ObjectFilterArgs {
 	fn into_params(self) -> Vec<object::WhereParam> {
 		use object::*;
 
-		chain_optional_iter(
+		sd_utils::chain_optional_iter(
 			[],
 			[
 				self.hidden.to_param(),
@@ -282,17 +286,24 @@ pub fn mount() -> AlphaRouter<Ctx> {
 				cursor: Option<Vec<u8>>,
 				#[serde(default)]
 				filter: FilePathFilterArgs,
+				#[serde(default = "default_group_directories")]
+				group_directories: bool,
+			}
+
+			fn default_group_directories() -> bool {
+				true
 			}
 
 			R.with2(library()).query(
-				|(_, library),
+				|(node, library),
 				 FilePathSearchArgs {
 				     take,
 				     order,
 				     cursor,
 				     filter,
+				     group_directories,
 				 }| async move {
-					let Library { db, .. } = &library;
+					let Library { db, .. } = library.as_ref();
 
 					let take = take.unwrap_or(100);
 
@@ -301,6 +312,12 @@ pub fn mount() -> AlphaRouter<Ctx> {
 						.find_many(filter.into_params(db).await?)
 						.take(take as i64 + 1);
 
+					// WARN: this order_by for grouping directories MUST always come before the other order_by
+					if group_directories {
+						query = query.order_by(file_path::is_dir::order(prisma::SortOrder::Desc));
+					}
+
+					// WARN: this order_by for sorting data MUST always come after the other order_by
 					if let Some(order) = order {
 						query = query.order_by(order.into_param());
 					}
@@ -328,7 +345,7 @@ pub fn mount() -> AlphaRouter<Ctx> {
 					for file_path in file_paths {
 						let thumbnail_exists_locally = if let Some(cas_id) = &file_path.cas_id {
 							library
-								.thumbnail_exists(cas_id)
+								.thumbnail_exists(&node, cas_id)
 								.await
 								.map_err(LocationError::from)?
 						} else {
@@ -361,14 +378,14 @@ pub fn mount() -> AlphaRouter<Ctx> {
 			}
 
 			R.with2(library()).query(
-				|(_, library),
+				|(node, library),
 				 ObjectSearchArgs {
 				     take,
 				     order,
 				     cursor,
 				     filter,
 				 }| async move {
-					let Library { db, .. } = &library;
+					let Library { db, .. } = library.as_ref();
 
 					let take = take.unwrap_or(100);
 
@@ -409,7 +426,7 @@ pub fn mount() -> AlphaRouter<Ctx> {
 							.find_map(|c| c);
 
 						let thumbnail_exists_locally = if let Some(cas_id) = cas_id {
-							library.thumbnail_exists(cas_id).await.map_err(|e| {
+							library.thumbnail_exists(&node, cas_id).await.map_err(|e| {
 								rspc::Error::with_cause(
 									ErrorCode::InternalServerError,
 									"Failed to check that thumbnail exists".to_string(),
