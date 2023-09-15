@@ -12,7 +12,7 @@ use tokio::{
 	sync::{mpsc, RwLock},
 	time::{sleep_until, Instant, Sleep},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::{DiscoveredPeer, Event, Manager, Metadata, MetadataManager, PeerId};
 
@@ -38,6 +38,7 @@ where
 	mdns_service_receiver: flume::Receiver<ServiceEvent>,
 	service_name: String,
 	next_mdns_advertisement: Pin<Box<Sleep>>,
+	next_allowed_discovery_advertisement: Instant,
 	trigger_advertisement: mpsc::UnboundedReceiver<()>,
 	pub(crate) state: Arc<MdnsState<TMetadata>>,
 }
@@ -70,6 +71,7 @@ where
 				mdns_service_receiver,
 				service_name,
 				next_mdns_advertisement: Box::pin(sleep_until(Instant::now())), // Trigger an advertisement immediately
+				next_allowed_discovery_advertisement: Instant::now(),
 				trigger_advertisement: advertise_rx,
 				state: state.clone(),
 			},
@@ -84,11 +86,18 @@ where
 
 	/// Do an mdns advertisement to the network.
 	async fn advertise(&mut self) {
+		self.inner_advertise().await;
+
+		self.next_mdns_advertisement =
+			Box::pin(sleep_until(Instant::now() + MDNS_READVERTISEMENT_INTERVAL));
+	}
+
+	async fn inner_advertise(&self) {
 		let metadata = self.metadata_manager.get().to_hashmap();
 
-		// This is in simple terms converts from `Vec<(ip, port)>` to `Vec<(Vec<Ip>, port)>`
-		let mut services = HashMap::<u16, ServiceInfo>::new();
-		for addr in self.state.listen_addrs.read().await.iter() {
+		let mut ports_to_service = HashMap::new();
+		let listen_addrs = self.state.listen_addrs.read().await;
+		for addr in listen_addrs.iter() {
 			let addr = match addr {
 				SocketAddr::V4(addr) => addr,
 				// TODO: Our mdns library doesn't support Ipv6. This code has the infra to support it so once this issue is fixed upstream we can just flip it on.
@@ -96,38 +105,34 @@ where
 				SocketAddr::V6(_) => continue,
 			};
 
-			if let Some(mut service) = services.remove(&addr.port()) {
-				service.insert_ipv4addr(*addr.ip());
-				services.insert(addr.port(), service);
-			} else {
-				let service = match ServiceInfo::new(
-					&self.service_name,
-					&self.peer_id.to_string(),
-					&format!("{}.", self.peer_id),
-					*addr.ip(),
-					addr.port(),
-					Some(metadata.clone()), // TODO: Prevent the user defining a value that overflows a DNS record
-				) {
-					Ok(service) => service,
-					Err(err) => {
-						warn!("error creating mdns service info: {}", err);
-						continue;
-					}
-				};
-				services.insert(addr.port(), service);
-			}
+			ports_to_service
+				.entry(addr.port())
+				.or_insert_with(Vec::new)
+				.push(addr.ip());
 		}
 
-		for (_, service) in services.into_iter() {
-			info!("advertising mdns service: {:?}", service);
+		for (port, ips) in ports_to_service.into_iter() {
+			let service = match ServiceInfo::new(
+				&self.service_name,
+				&self.peer_id.to_string(),
+				&format!("{}.", self.peer_id),
+				&*ips,
+				port,
+				Some(metadata.clone()), // TODO: Prevent the user defining a value that overflows a DNS record
+			) {
+				Ok(service) => service,
+				Err(err) => {
+					warn!("error creating mdns service info: {}", err);
+					continue;
+				}
+			};
+
+			trace!("advertising mdns service: {:?}", service);
 			match self.mdns_daemon.register(service) {
 				Ok(_) => {}
 				Err(err) => warn!("error registering mdns service: {}", err),
 			}
 		}
-
-		self.next_mdns_advertisement =
-			Box::pin(sleep_until(Instant::now() + MDNS_READVERTISEMENT_INTERVAL));
 	}
 
 	// TODO: if the channel's sender is dropped will this cause the `tokio::select` in the `manager.rs` to infinitely loop?
@@ -153,10 +158,11 @@ where
 								}
 
 								match TMetadata::from_hashmap(
+									&peer_id,
 									&info
 										.get_properties()
 										.iter()
-										.map(|v| (v.key().to_owned(), v.val().to_owned()))
+										.map(|v| (v.key().to_owned(), v.val_str().to_owned()))
 										.collect(),
 								) {
 									Ok(metadata) => {
@@ -165,9 +171,19 @@ where
 												self.state.discovered.write().await;
 
 											let peer = if let Some(peer) = discovered_peers.remove(&peer_id) {
-
 												peer
 											} else {
+												// Found a new peer, let's readvertise our mdns service as it may have just come online
+												// `self.last_discovery_advertisement` is to prevent DOS-style attacks.
+												let now = Instant::now();
+												if self.next_allowed_discovery_advertisement <= now {
+													self.next_allowed_discovery_advertisement = now + Duration::from_secs(1);
+
+													self.inner_advertise().await;
+													self.next_mdns_advertisement =
+														Box::pin(sleep_until(Instant::now() + MDNS_READVERTISEMENT_INTERVAL));
+												}
+
 												DiscoveredPeer {
 													manager: manager.clone(),
 													peer_id,
@@ -188,11 +204,13 @@ where
 											discovered_peers.insert(peer_id, peer.clone());
 											peer
 										};
+										debug!(
+											"Discovered peer by id '{}' with address '{:?}' and metadata: {:?}",
+											peer.peer_id, peer.addresses, peer.metadata
+										);
 										return Some(Event::PeerDiscovered(peer));
 									}
-									Err(err) => {
-										error!("error parsing metadata for peer '{}': {}", raw_peer_id, err)
-									}
+									Err(err) => error!("error parsing metadata for peer '{}': {}", raw_peer_id, err)
 								}
 							}
 							Err(_) => warn!(
@@ -216,9 +234,11 @@ where
 										self.state.discovered.write().await;
 									let peer = discovered_peers.remove(&peer_id);
 
+									let metadata = peer.map(|p| p.metadata);
+									debug!("Peer '{peer_id}' expired with metadata: {metadata:?}");
 									return Some(Event::PeerExpired {
 										id: peer_id,
-										metadata: peer.map(|p| p.metadata),
+										metadata,
 									});
 								}
 							}

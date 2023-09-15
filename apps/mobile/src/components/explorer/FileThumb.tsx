@@ -1,14 +1,15 @@
 import { getIcon } from '@sd/assets/util';
-import { PropsWithChildren, useEffect, useLayoutEffect, useMemo, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useState, type PropsWithChildren } from 'react';
 import { Image, View } from 'react-native';
 import { DocumentDirectoryPath } from 'react-native-fs';
 import {
-	ExplorerItem,
 	getExplorerItemData,
 	getItemFilePath,
 	getItemLocation,
-	isDarkTheme
+	isDarkTheme,
+	type ExplorerItem
 } from '@sd/client';
+
 import { flattenThumbnailKey, useExplorerStore } from '~/stores/explorerStore';
 import { tw } from '../../lib/tailwind';
 
@@ -122,7 +123,7 @@ export default function FileThumb({ size = 1, ...props }: FileThumbProps) {
 				if (isDir !== null) setSrc(getIcon(kind, isDarkTheme(), extension, isDir));
 				break;
 		}
-	}, [filePath?.id, itemData, props.data.item.id, thumbType]);
+	}, [itemData, thumbType]);
 
 	return (
 		<FileThumbWrapper size={size}>

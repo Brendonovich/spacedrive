@@ -1,44 +1,48 @@
+import { CaretDown, CaretUp } from '@phosphor-icons/react';
 import {
-	ColumnDef,
-	ColumnSizingState,
-	Row,
 	flexRender,
 	getCoreRowModel,
-	useReactTable
+	useReactTable,
+	type ColumnDef,
+	type ColumnSizingState,
+	type Row
 } from '@tanstack/react-table';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import clsx from 'clsx';
 import dayjs from 'dayjs';
-import { CaretDown, CaretUp } from 'phosphor-react';
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ScrollSync, ScrollSyncPane } from 'react-scroll-sync';
 import { useKey, useMutationObserver, useWindowEventListener } from 'rooks';
 import useResizeObserver from 'use-resize-observer';
 import {
-	ExplorerItem,
-	ExplorerSettings,
-	FilePath,
-	ObjectKind,
 	byteSize,
 	getExplorerItemData,
 	getItemFilePath,
 	getItemLocation,
 	getItemObject,
-	isPath
+	type ExplorerItem,
+	type FilePath,
+	type NonIndexedPathItem
 } from '@sd/client';
 import { Tooltip } from '@sd/ui';
 import { useIsTextTruncated, useScrolled } from '~/hooks';
 import { stringify } from '~/util/uuid';
+
 import { ViewItem } from '.';
 import { useLayoutContext } from '../../Layout/Context';
 import { useExplorerContext } from '../Context';
 import { FileThumb } from '../FilePath/Thumb';
 import { InfoPill } from '../Inspector';
+import { getQuickPreviewStore, useQuickPreviewStore } from '../QuickPreview/store';
+import {
+	createOrdering,
+	getOrderingDirection,
+	isCut,
+	orderingKey,
+	useExplorerStore
+} from '../store';
+import { uniqueId } from '../util';
 import { useExplorerViewContext } from '../ViewContext';
-import { createOrdering, getOrderingDirection, orderingKey } from '../store';
-import { isCut } from '../store';
-import { ExplorerItemHash } from '../useExplorer';
-import { explorerItemHash } from '../util';
 import RenamableItemText from './RenamableItemText';
 
 interface ListViewItemProps {
@@ -89,13 +93,16 @@ const HeaderColumnName = ({ name }: { name: string }) => {
 	);
 };
 
-type Range = [ExplorerItemHash, ExplorerItemHash];
+type Range = [string, string];
 
 export default () => {
-	const explorer = useExplorerContext();
-	const settings = explorer.useSettingsSnapshot();
-	const explorerView = useExplorerViewContext();
 	const layout = useLayoutContext();
+	const explorer = useExplorerContext();
+	const explorerStore = useExplorerStore();
+	const explorerView = useExplorerViewContext();
+	const settings = explorer.useSettingsSnapshot();
+
+	const quickPreviewStore = useQuickPreviewStore();
 
 	const tableRef = useRef<HTMLDivElement>(null);
 	const tableHeaderRef = useRef<HTMLDivElement>(null);
@@ -131,7 +138,8 @@ export default () => {
 	const { width: tableWidth = 0 } = useResizeObserver({ ref: tableRef });
 	const { width: headerWidth = 0 } = useResizeObserver({ ref: tableHeaderRef });
 
-	const getFileName = (path: FilePath) => `${path.name}${path.extension && `.${path.extension}`}`;
+	const getFileName = (path: FilePath | NonIndexedPathItem) =>
+		`${path.name}${path.extension && `.${path.extension}`}`;
 
 	useEffect(() => {
 		//we need this to trigger a re-render with the updated column sizes from the store
@@ -161,7 +169,7 @@ export default () => {
 
 					const selected = explorer.selectedItems.has(cell.row.original);
 
-					const cut = isCut(item.item.id);
+					const cut = isCut(item, explorerStore.cutCopyState);
 
 					return (
 						<div className="relative flex items-center">
@@ -177,7 +185,11 @@ export default () => {
 								allowHighlight={false}
 								item={item}
 								selected={selected}
-								disabled={!selected || explorer.selectedItems.size > 1}
+								disabled={
+									!selected ||
+									explorer.selectedItems.size > 1 ||
+									quickPreviewStore.open
+								}
 								style={{ maxHeight: 36 }}
 							/>
 						</div>
@@ -189,21 +201,12 @@ export default () => {
 				header: 'Type',
 				size: settings.colSizes['kind'],
 				enableSorting: false,
-				accessorFn: (file) => {
-					return isPath(file) && file.item.is_dir
-						? 'Folder'
-						: ObjectKind[getItemObject(file)?.kind || 0];
-				},
-				cell: (cell) => {
-					const file = cell.row.original;
-					return (
-						<InfoPill className="bg-app-button/50">
-							{isPath(file) && file.item.is_dir
-								? 'Folder'
-								: ObjectKind[getItemObject(file)?.kind || 0]}
-						</InfoPill>
-					);
-				}
+				accessorFn: (file) => getExplorerItemData(file).kind,
+				cell: (cell) => (
+					<InfoPill className="bg-app-button/50">
+						{getExplorerItemData(cell.row.original).kind}
+					</InfoPill>
+				)
 			},
 			{
 				id: 'sizeInBytes',
@@ -232,8 +235,12 @@ export default () => {
 			{
 				id: 'dateIndexed',
 				header: 'Date Indexed',
-				accessorFn: (file) =>
-					dayjs(getItemFilePath(file)?.date_indexed).format('MMM Do YYYY')
+				accessorFn: (file) => {
+					const item = getItemFilePath(file);
+					return dayjs(
+						(item && 'date_indexed' in item && item.date_indexed) || null
+					).format('MMM Do YYYY');
+				}
 			},
 			{
 				id: 'dateAccessed',
@@ -262,27 +269,32 @@ export default () => {
 				}
 			}
 		],
-		[explorer.selectedItems, settings.colSizes]
+		[
+			settings.colSizes,
+			explorer.selectedItems,
+			explorerStore.cutCopyState,
+			quickPreviewStore.open
+		]
 	);
 
 	const table = useReactTable({
-		data: explorer.items || [],
+		data: useMemo(() => explorer.items ?? [], [explorer.items]),
 		columns,
 		defaultColumn: { minSize: 100, maxSize: 250 },
 		state: { columnSizing },
 		onColumnSizingChange: setColumnSizing,
 		columnResizeMode: 'onChange',
-		getCoreRowModel: getCoreRowModel(),
-		getRowId: (item) => explorerItemHash(item)
+		getCoreRowModel: useMemo(() => getCoreRowModel(), []),
+		getRowId: uniqueId
 	});
 
+	const rows = table.getRowModel().rows;
 	const tableLength = table.getTotalSize();
-	const rows = useMemo(() => table.getRowModel().rows, [explorer.items]);
 
 	const rowVirtualizer = useVirtualizer({
-		count: explorer.items ? rows.length : 100,
-		getScrollElement: () => explorer.scrollRef.current,
-		estimateSize: () => rowHeight,
+		count: explorer.count ?? rows.length,
+		getScrollElement: useCallback(() => explorer.scrollRef.current, [explorer.scrollRef]),
+		estimateSize: useCallback(() => rowHeight, []),
 		paddingStart: paddingY + (isScrolled ? 35 : 0),
 		paddingEnd: paddingY,
 		scrollMargin: listOffset
@@ -426,6 +438,7 @@ export default () => {
 		e: React.MouseEvent<HTMLDivElement, MouseEvent>,
 		row: Row<ExplorerItem>
 	) {
+		// Ensure mouse click is with left button
 		if (e.button !== 0) return;
 
 		const rowIndex = row.index;
@@ -447,7 +460,7 @@ export default () => {
 					const [rangeStart] = items;
 
 					if (rangeStart) {
-						setRanges([[explorerItemHash(rangeStart), explorerItemHash(item)]]);
+						setRanges([[uniqueId(rangeStart), uniqueId(item)]]);
 					}
 
 					explorer.resetSelectedItems(items);
@@ -498,7 +511,7 @@ export default () => {
 
 					const item = row.original;
 
-					if (explorerItemHash(item) === explorerItemHash(range.start.original)) return;
+					if (uniqueId(item) === uniqueId(range.start.original)) return;
 
 					if (
 						!range.direction ||
@@ -559,7 +572,7 @@ export default () => {
 
 				setRanges([
 					..._ranges.slice(0, _ranges.length - 1),
-					[explorerItemHash(range.start.original), explorerItemHash(newRangeEnd)]
+					[uniqueId(range.start.original), uniqueId(newRangeEnd)]
 				]);
 			} else if (e.metaKey) {
 				const { rows } = table.getCoreRowModel();
@@ -588,12 +601,8 @@ export default () => {
 								setRanges([
 									..._ranges,
 									[
-										explorerItemHash(
-											closestRange.direction === 'down' ? start : end
-										),
-										explorerItemHash(
-											closestRange.direction === 'down' ? end : start
-										)
+										uniqueId(closestRange.direction === 'down' ? start : end),
+										uniqueId(closestRange.direction === 'down' ? end : start)
 									]
 								]);
 							} else {
@@ -614,10 +623,7 @@ export default () => {
 							if (start !== undefined) {
 								const end = rangeStart === item ? rangeEnd : rangeStart;
 
-								setRanges([
-									..._ranges,
-									[explorerItemHash(start), explorerItemHash(end)]
-								]);
+								setRanges([..._ranges, [uniqueId(start), uniqueId(end)]]);
 							}
 						} else {
 							const rowBefore = rows[row.index - 1];
@@ -625,13 +631,13 @@ export default () => {
 
 							if (rowBefore && rowAfter) {
 								const firstRange = [
-									explorerItemHash(rangeStart),
-									explorerItemHash(rowBefore.original)
+									uniqueId(rangeStart),
+									uniqueId(rowBefore.original)
 								] satisfies Range;
 
 								const secondRange = [
-									explorerItemHash(rowAfter.original),
-									explorerItemHash(rangeEnd)
+									uniqueId(rowAfter.original),
+									uniqueId(rangeEnd)
 								] satisfies Range;
 
 								const _ranges = ranges.filter(
@@ -645,7 +651,7 @@ export default () => {
 				} else {
 					explorer.addSelectedItem(item);
 
-					const itemRange: Range = [explorerItemHash(item), explorerItemHash(item)];
+					const itemRange: Range = [uniqueId(item), uniqueId(item)];
 
 					const _ranges = [...ranges, itemRange];
 
@@ -669,8 +675,8 @@ export default () => {
 						setRanges([
 							..._ranges,
 							[
-								explorerItemHash(rangeUp.sorted.start.original),
-								explorerItemHash(rangeDown.sorted.end.original)
+								uniqueId(rangeUp.sorted.start.original),
+								uniqueId(rangeDown.sorted.end.original)
 							],
 							itemRange
 						]);
@@ -683,8 +689,8 @@ export default () => {
 							setRanges([
 								..._ranges,
 								[
-									explorerItemHash(item),
-									explorerItemHash(
+									uniqueId(item),
+									uniqueId(
 										closestRange.direction === 'down'
 											? closestRange.sorted.end.original
 											: closestRange.sorted.start.original
@@ -697,8 +703,10 @@ export default () => {
 					}
 				}
 			} else {
+				if (isSelected(item)) return;
+
 				explorer.resetSelectedItems([item]);
-				const hash = explorerItemHash(item);
+				const hash = uniqueId(item);
 				setRanges([[hash, hash]]);
 			}
 		} else {
@@ -713,18 +721,19 @@ export default () => {
 
 		if (!isSelected(item)) {
 			explorer.resetSelectedItems([item]);
-			const hash = explorerItemHash(item);
+			const hash = uniqueId(item);
 			setRanges([[hash, hash]]);
 		}
 	}
 
-	function handleResize() {
+	useEffect(() => {
 		if (locked && Object.keys(columnSizing).length > 0) {
 			table.setColumnSizing((sizing) => {
 				const nameSize = sizing.name;
 				const nameColumnMinSize = table.getColumn('name')?.columnDef.minSize;
 				const newNameSize =
 					(nameSize || 0) + tableWidth - paddingX * 2 - scrollBarWidth - tableLength;
+
 				return {
 					...sizing,
 					...(nameSize !== undefined && nameColumnMinSize !== undefined
@@ -740,34 +749,36 @@ export default () => {
 		} else if (Math.abs(tableWidth - (tableLength + paddingX * 2 + scrollBarWidth)) < 15) {
 			setLocked(true);
 		}
-	}
-
-	useEffect(() => handleResize(), [tableWidth]);
+		// TODO: This should only depends on tableWidth, the lock logic should be behind a useEffectEvent (experimental)
+		// https://react.dev/learn/separating-events-from-effects#declaring-an-effect-event
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [tableWidth]);
 
 	useEffect(() => setRanges([]), [explorer.items]);
 
 	// Measure initial column widths
 	useEffect(() => {
-		if (tableRef.current) {
-			const columns = table.getAllColumns();
-			const sizings = columns.reduce(
-				(sizings, column) => ({ ...sizings, [column.id]: column.getSize() }),
-				{} as ColumnSizingState
-			);
-			const scrollWidth = tableRef.current.offsetWidth;
-			const sizingsSum = Object.values(sizings).reduce((a, b) => a + b, 0);
+		if (!tableRef.current || sized) return;
 
-			if (sizingsSum < scrollWidth) {
-				const nameColSize = sizings.name;
-				const nameWidth =
-					scrollWidth - paddingX * 2 - scrollBarWidth - (sizingsSum - (nameColSize || 0));
+		const columns = table.getAllColumns();
+		const sizings = columns.reduce(
+			(sizings, column) => ({ ...sizings, [column.id]: column.getSize() }),
+			{} as ColumnSizingState
+		);
+		const scrollWidth = tableRef.current.offsetWidth;
+		const sizingsSum = Object.values(sizings).reduce((a, b) => a + b, 0);
 
-				table.setColumnSizing({ ...sizings, name: nameWidth });
-				setLocked(true);
-			} else table.setColumnSizing(sizings);
-			setSized(true);
-		}
-	}, []);
+		if (sizingsSum < scrollWidth) {
+			const nameColSize = sizings.name;
+			const nameWidth =
+				scrollWidth - paddingX * 2 - scrollBarWidth - (sizingsSum - (nameColSize || 0));
+
+			table.setColumnSizing({ ...sizings, name: nameWidth });
+			setLocked(true);
+		} else table.setColumnSizing(sizings);
+
+		setSized(true);
+	}, [sized, table, paddingX]);
 
 	// Load more items
 	useEffect(() => {
@@ -776,17 +787,12 @@ export default () => {
 		const lastRow = virtualRows[virtualRows.length - 1];
 		if (!lastRow) return;
 
-		const rowsBeforeLoadMore = explorer.rowsBeforeLoadMore || 1;
+		const loadMoreFromRow = Math.ceil(rows.length * 0.75);
 
-		const loadMoreOnIndex =
-			rowsBeforeLoadMore > rows.length || lastRow.index > rows.length - rowsBeforeLoadMore
-				? rows.length - 1
-				: rows.length - rowsBeforeLoadMore;
+		if (lastRow.index >= loadMoreFromRow - 1) explorer.loadMore.call(undefined);
+	}, [virtualRows, rows.length, explorer.loadMore]);
 
-		if (lastRow.index === loadMoreOnIndex) explorer.loadMore.call(undefined);
-	}, [virtualRows, rows.length, explorer.rowsBeforeLoadMore, explorer.loadMore]);
-
-	useKey(['ArrowUp', 'ArrowDown'], (e) => {
+	useKey(['ArrowUp', 'ArrowDown', 'Escape'], (e) => {
 		if (!explorerView.selectable) return;
 
 		e.preventDefault();
@@ -794,6 +800,12 @@ export default () => {
 		const range = getRangeByIndex(ranges.length - 1);
 
 		if (!range) return;
+
+		if (e.key === 'Escape') {
+			explorer.resetSelectedItems([]);
+			setRanges([]);
+			return;
+		}
 
 		const keyDirection = e.key === 'ArrowDown' ? 'down' : 'up';
 
@@ -804,7 +816,7 @@ export default () => {
 		const item = nextRow.original;
 
 		if (explorer.allowMultiSelect) {
-			if (e.shiftKey) {
+			if (e.shiftKey && !getQuickPreviewStore().open) {
 				const direction = range.direction || keyDirection;
 
 				const [backRange, frontRange] = getRangesByRow(range.start);
@@ -822,12 +834,12 @@ export default () => {
 						let _ranges = [...ranges];
 
 						_ranges[backRange.index] = [
-							explorerItemHash(
+							uniqueId(
 								backRange.direction !== keyDirection
 									? backRange.start.original
 									: nextRow.original
 							),
-							explorerItemHash(
+							uniqueId(
 								backRange.direction !== keyDirection
 									? nextRow.original
 									: backRange.end.original
@@ -842,13 +854,10 @@ export default () => {
 						} else {
 							_ranges[frontRange.index] =
 								frontRange.start.index === frontRange.end.index
-									? [
-											explorerItemHash(nextRow.original),
-											explorerItemHash(nextRow.original)
-									  ]
+									? [uniqueId(nextRow.original), uniqueId(nextRow.original)]
 									: [
-											explorerItemHash(frontRange.start.original),
-											explorerItemHash(nextRow.original)
+											uniqueId(frontRange.start.original),
+											uniqueId(nextRow.original)
 									  ];
 						}
 
@@ -856,10 +865,7 @@ export default () => {
 					} else {
 						setRanges([
 							...ranges.slice(0, ranges.length - 1),
-							[
-								explorerItemHash(range.start.original),
-								explorerItemHash(nextRow.original)
-							]
+							[uniqueId(range.start.original), uniqueId(nextRow.original)]
 						]);
 					}
 				} else {
@@ -891,8 +897,8 @@ export default () => {
 								: backRange.end.original;
 
 						_ranges[backRange.index] = [
-							explorerItemHash(backRangeStart),
-							explorerItemHash(backRangeEnd)
+							uniqueId(backRangeStart),
+							uniqueId(backRangeEnd)
 						];
 
 						if (
@@ -902,19 +908,13 @@ export default () => {
 						) {
 							_ranges[backRange.index] =
 								rangeEndRow.original === backRangeStart
-									? [
-											explorerItemHash(backRangeEnd),
-											explorerItemHash(backRangeStart)
-									  ]
-									: [
-											explorerItemHash(backRangeStart),
-											explorerItemHash(backRangeEnd)
-									  ];
+									? [uniqueId(backRangeEnd), uniqueId(backRangeStart)]
+									: [uniqueId(backRangeStart), uniqueId(backRangeEnd)];
 						}
 
 						_ranges[frontRange.index] = [
-							explorerItemHash(frontRange.start.original),
-							explorerItemHash(rangeEndRow.original)
+							uniqueId(frontRange.start.original),
+							uniqueId(rangeEndRow.original)
 						];
 
 						if (closestRange) {
@@ -929,16 +929,13 @@ export default () => {
 
 						setRanges([
 							..._ranges.slice(0, _ranges.length - 1),
-							[
-								explorerItemHash(range.start.original),
-								explorerItemHash(rangeEndRow.original)
-							]
+							[uniqueId(range.start.original), uniqueId(rangeEndRow.original)]
 						]);
 					}
 				}
 			} else {
 				explorer.resetSelectedItems([item]);
-				const hash = explorerItemHash(item);
+				const hash = uniqueId(item);
 				setRanges([[hash, hash]]);
 			}
 		} else explorer.resetSelectedItems([item]);
@@ -1141,26 +1138,6 @@ export default () => {
 									}}
 								>
 									{virtualRows.map((virtualRow) => {
-										if (!explorer.items) {
-											return (
-												<div
-													key={virtualRow.index}
-													className="absolute left-0 top-0 flex w-full py-px"
-													style={{
-														height: `${virtualRow.size}px`,
-														transform: `translateY(${
-															virtualRow.start -
-															rowVirtualizer.options.scrollMargin
-														}px)`,
-														paddingLeft: `${paddingX}px`,
-														paddingRight: `${paddingX}px`
-													}}
-												>
-													<div className="relative flex h-full w-full animate-pulse rounded-md bg-app-box" />
-												</div>
-											);
-										}
-
 										const row = rows[virtualRow.index];
 										if (!row) return null;
 
@@ -1174,7 +1151,7 @@ export default () => {
 										const selectedNext =
 											nextRow && isSelected(nextRow.original);
 
-										const cut = isCut(row.original.item.id);
+										const cut = isCut(row.original, explorerStore.cutCopyState);
 
 										return (
 											<div

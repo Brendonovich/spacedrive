@@ -2,12 +2,13 @@ import React from 'react';
 import { Alert, Pressable, View, ViewStyle } from 'react-native';
 import {
 	ExplorerItem,
-	ObjectKind,
+	getExplorerItemData,
 	getItemFilePath,
 	getItemObject,
 	isPath,
 	useLibraryQuery
 } from '@sd/client';
+
 import { InfoPill, PlaceholderPill } from '~/components/primitive/InfoPill';
 import { tw, twStyle } from '~/lib/tailwind';
 
@@ -21,7 +22,7 @@ const InfoTagPills = ({ data, style }: Props) => {
 	const filePath = getItemFilePath(data);
 
 	const tagsQuery = useLibraryQuery(['tags.getForObject', objectData?.id ?? -1], {
-		enabled: Boolean(objectData)
+		enabled: objectData != null
 	});
 
 	const isDir = data && isPath(data) ? data.item.is_dir : false;
@@ -29,10 +30,7 @@ const InfoTagPills = ({ data, style }: Props) => {
 	return (
 		<View style={twStyle('mt-1 flex flex-row flex-wrap', style)}>
 			{/* Kind */}
-			<InfoPill
-				containerStyle={tw`mr-1`}
-				text={isDir ? 'Folder' : ObjectKind[objectData?.kind || 0]!}
-			/>
+			<InfoPill containerStyle={tw`mr-1`} text={getExplorerItemData(data).kind} />
 			{/* Extension */}
 			{filePath?.extension && (
 				<InfoPill text={filePath.extension} containerStyle={tw`mr-1`} />

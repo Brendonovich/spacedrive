@@ -1,6 +1,4 @@
-import { ReactNode, RefObject, createContext, useContext } from 'react';
-
-export type ExplorerViewSelection = number | Set<number>;
+import { createContext, useContext, type ReactNode, type RefObject } from 'react';
 
 export interface ExplorerViewContext {
 	ref: RefObject<HTMLDivElement>;

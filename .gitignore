@@ -15,7 +15,7 @@ cli/turbo.exe
 storybook-static/
 .DS_Store
 cache
-.env
+.env*
 vendor/
 data
 node_modules
@@ -76,6 +76,5 @@ dev.db-journal
 /core/migration_test
 sd_init.json
 
-spacedrive
 .cargo/config
 .github/scripts/deps

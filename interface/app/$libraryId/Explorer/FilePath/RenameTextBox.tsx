@@ -1,22 +1,22 @@
 import clsx from 'clsx';
 import {
-	ComponentProps,
 	forwardRef,
 	useCallback,
 	useEffect,
 	useImperativeHandle,
 	useRef,
-	useState
+	useState,
+	type ComponentProps
 } from 'react';
 import { useKey } from 'rooks';
 import { useLibraryMutation, useRspcLibraryContext } from '@sd/client';
-import { Tooltip } from '~/../packages/ui/src';
-import { showAlertDialog } from '~/components';
+import { toast, Tooltip } from '@sd/ui';
 import { useIsTextTruncated, useOperatingSystem } from '~/hooks';
+
 import { useExplorerViewContext } from '../ViewContext';
 
 type Props = ComponentProps<'div'> & {
-	itemId: number;
+	itemId?: null | number;
 	locationId: number | null;
 	text: string | null;
 	activeClassName?: string;
@@ -33,138 +33,125 @@ export const RenameTextBoxBase = forwardRef<HTMLDivElement | null, Props>(
 		const os = useOperatingSystem();
 
 		const [allowRename, setAllowRename] = useState(false);
-		const [renamable, setRenamable] = useState(false);
+
+		const renamable = useRef<boolean>(false);
+		const timeout = useRef<NodeJS.Timeout | null>(null);
 
 		const ref = useRef<HTMLDivElement>(null);
 		useImperativeHandle<HTMLDivElement | null, HTMLDivElement | null>(_ref, () => ref.current);
 
+		//this is to determine if file name is truncated
+		const isTruncated = useIsTextTruncated(ref, text);
+
 		// Highlight file name up to extension or
 		// fully if it's a directory or has no extension
 		const highlightText = useCallback(() => {
-			if (ref?.current) {
-				const range = document.createRange();
-				const node = ref.current.firstChild;
-				if (!node) return;
+			if (!ref.current || !text) return;
 
-				const endRange = text?.lastIndexOf('.');
+			const node = ref.current.firstChild;
+			if (!node) return;
 
-				range.setStart(node, 0);
-				range.setEnd(node, endRange && endRange !== -1 ? endRange : text?.length || 0);
+			const endRange = text.lastIndexOf('.');
 
-				const sel = window.getSelection();
-				sel?.removeAllRanges();
-				sel?.addRange(range);
-			}
+			const range = document.createRange();
+
+			range.setStart(node, 0);
+			range.setEnd(node, endRange !== -1 ? endRange : text.length);
+
+			const sel = window.getSelection();
+			if (!sel) return;
+
+			sel.removeAllRanges();
+			sel.addRange(range);
 		}, [text]);
 
 		// Blur field
-		function blur() {
-			if (ref?.current) {
-				ref.current.blur();
-				setAllowRename(false);
-			}
-		}
+		const blur = useCallback(() => ref.current?.blur(), []);
 
 		// Reset to original file name
-		function reset() {
-			if (ref?.current) {
-				ref.current.innerText = text || '';
+		const reset = () => ref.current && (ref.current.innerText = text ?? '');
+
+		const handleRename = async () => {
+			const newName = ref.current?.innerText.trim();
+
+			if (!newName || newName === text) {
+				reset();
+				return;
 			}
-		}
-
-		async function handleRename() {
-			if (!ref?.current) return;
-
-			const newName = ref?.current.innerText.trim();
-			if (!newName) return reset();
-
-			if (!locationId) return;
-
-			const oldName = text;
-
-			if (!oldName || !locationId || newName === oldName) return;
 
 			await renameHandler(newName);
-		}
+		};
 
-		// Handle keydown events
-		function handleKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+		const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
 			switch (e.key) {
-				case 'Tab':
+				case 'Tab': {
 					e.preventDefault();
 					blur();
 					break;
-				case 'Escape':
+				}
+
+				case 'Escape': {
+					e.stopPropagation();
 					reset();
 					blur();
 					break;
-				case 'z':
+				}
+
+				case 'z': {
 					if (os === 'macOS' ? e.metaKey : e.ctrlKey) {
 						reset();
 						highlightText();
 					}
-					break;
-			}
-		}
-
-		//this is to determine if file name is truncated
-		const isTruncated = useIsTextTruncated(ref, text);
-
-		// Focus and highlight when renaming is allowed
-		useEffect(() => {
-			if (allowRename) {
-				setTimeout(() => {
-					if (ref?.current) {
-						ref.current.focus();
-						highlightText();
-					}
-				});
-			}
-		}, [allowRename, explorerView, highlightText]);
-
-		// Handle renaming when triggered from outside
-		useEffect(() => {
-			if (!disabled) {
-				if (explorerView.isRenaming && !allowRename) setAllowRename(true);
-				else if (!explorerView.isRenaming && allowRename) setAllowRename(false);
-			}
-		}, [explorerView.isRenaming, disabled, allowRename]);
-
-		useEffect(() => {
-			function handleClickOutside(event: MouseEvent) {
-				if (ref?.current && !ref.current.contains(event.target as Node)) {
-					blur();
 				}
 			}
+		};
 
-			document.addEventListener('mousedown', handleClickOutside, true);
-			return () => {
-				document.removeEventListener('mousedown', handleClickOutside, true);
-			};
-		}, [ref]);
+		const resetState = () => {
+			setAllowRename(false);
+			renamable.current = false;
+			if (timeout.current) {
+				clearTimeout(timeout.current);
+				timeout.current = null;
+			}
+		};
 
-		// Rename or blur on Enter key
 		useKey('Enter', (e) => {
 			e.preventDefault();
 
 			if (allowRename) blur();
-			else if (!disabled) {
-				setAllowRename(true);
-				explorerView.setIsRenaming(true);
-			}
+			else if (!disabled) setAllowRename(true);
 		});
 
 		useEffect(() => {
+			const element = ref.current;
+			if (!element || !allowRename) return;
+
 			const scroll = (e: WheelEvent) => {
-				if (allowRename) {
-					e.preventDefault();
-					if (ref.current) ref.current.scrollTop += e.deltaY;
-				}
+				e.preventDefault();
+				element.scrollTop += e.deltaY;
 			};
 
-			ref.current?.addEventListener('wheel', scroll);
-			return () => ref.current?.removeEventListener('wheel', scroll);
-		}, [allowRename]);
+			highlightText();
+
+			element.addEventListener('wheel', scroll);
+			return () => element.removeEventListener('wheel', scroll);
+		}, [allowRename, highlightText]);
+
+		useEffect(() => {
+			if (!disabled) {
+				if (explorerView.isRenaming && !allowRename) setAllowRename(true);
+				else explorerView.setIsRenaming(allowRename);
+			} else resetState();
+		}, [explorerView.isRenaming, disabled, allowRename, explorerView]);
+
+		useEffect(() => {
+			const onMouseDown = (event: MouseEvent) => {
+				if (!ref.current?.contains(event.target as Node)) blur();
+			};
+
+			document.addEventListener('mousedown', onMouseDown, true);
+			return () => document.removeEventListener('mousedown', onMouseDown, true);
+		}, [blur]);
 
 		return (
 			<Tooltip label={!isTruncated || allowRename ? null : text} asChild>
@@ -174,27 +161,29 @@ export const RenameTextBoxBase = forwardRef<HTMLDivElement | null, Props>(
 					contentEditable={allowRename}
 					suppressContentEditableWarning
 					className={clsx(
-						'cursor-default truncate rounded-md px-1.5 py-px text-xs text-ink',
+						'cursor-default truncate rounded-md px-1.5 py-px text-xs text-ink outline-none',
 						allowRename && [
-							'whitespace-normal bg-app outline-none ring-2 ring-accent-deep',
+							'whitespace-normal bg-app ring-2 ring-accent-deep',
 							activeClassName
 						],
 						className
 					)}
-					onDoubleClick={(e) => e.stopPropagation()}
-					onMouseDown={(e) => e.button === 0 && setRenamable(!disabled)}
+					onDoubleClick={(e) => {
+						if (allowRename) e.stopPropagation();
+						renamable.current = false;
+					}}
+					onMouseDownCapture={(e) => e.button === 0 && (renamable.current = !disabled)}
 					onMouseUp={(e) => {
-						if (e.button === 0) {
-							if (renamable) {
-								setAllowRename(true);
-								explorerView.setIsRenaming(true);
-							}
-							setRenamable(false);
+						if (e.button === 0 || renamable.current || !allowRename) {
+							timeout.current = setTimeout(
+								() => renamable.current && setAllowRename(true),
+								350
+							);
 						}
 					}}
-					onBlur={async () => {
-						await handleRename();
-						setAllowRename(false);
+					onBlur={() => {
+						handleRename();
+						resetState();
 						explorerView.setIsRenaming(false);
 					}}
 					onKeyDown={handleKeyDown}
@@ -222,7 +211,7 @@ export const RenamePathTextBox = ({
 	// Reset to original file name
 	function reset() {
 		if (ref?.current) {
-			ref.current.innerText = props.text || '';
+			ref.current.innerText = fileName ?? '';
 		}
 	}
 
@@ -230,7 +219,10 @@ export const RenamePathTextBox = ({
 
 	// Handle renaming
 	async function rename(newName: string) {
-		if (!props.locationId || newName === fileName) return;
+		if (!props.locationId || !props.itemId || newName === fileName) {
+			reset();
+			return;
+		}
 		try {
 			await renameFile.mutateAsync({
 				location_id: props.locationId,
@@ -242,9 +234,10 @@ export const RenamePathTextBox = ({
 				}
 			});
 		} catch (e) {
-			showAlertDialog({
-				title: 'Error',
-				value: `Could not rename ${fileName} to ${newName}, due to an error: ${e}`
+			reset();
+			toast.error({
+				title: `Could not rename ${fileName} to ${newName}`,
+				body: `Error: ${e}.`
 			});
 		}
 	}
@@ -270,10 +263,14 @@ export const RenameLocationTextBox = (props: Omit<Props, 'renameHandler'>) => {
 
 	// Handle renaming
 	async function rename(newName: string) {
-		if (!props.locationId) return;
+		if (!props.locationId) {
+			reset();
+			return;
+		}
 		try {
 			await renameLocation.mutateAsync({
 				id: props.locationId,
+				path: null,
 				name: newName,
 				generate_preview_media: null,
 				sync_preview_media: null,
@@ -281,10 +278,8 @@ export const RenameLocationTextBox = (props: Omit<Props, 'renameHandler'>) => {
 				indexer_rules_ids: []
 			});
 		} catch (e) {
-			showAlertDialog({
-				title: 'Error',
-				value: String(e)
-			});
+			reset();
+			toast.error({ title: 'Failed to rename', body: `Error: ${e}.` });
 		}
 	}
 

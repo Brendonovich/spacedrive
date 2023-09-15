@@ -11,6 +11,7 @@ import {
 	useOnlineLocations
 } from '@sd/client';
 import { Button, Tooltip } from '@sd/ui';
+
 import { AddLocationButton } from '~/app/$libraryId/settings/library/locations/AddLocationButton';
 import { Folder, SubtleButton } from '~/components';
 import SidebarLink from './Link';
@@ -65,12 +66,10 @@ export const LibrarySection = () => {
 			<Section
 				name="Nodes"
 				actionArea={
-					isPairingEnabled ? (
+					isPairingEnabled && (
 						<Link to="settings/library/nodes">
 							<SubtleButton />
 						</Link>
-					) : (
-						<SubtleButton />
 					)
 				}
 			>
@@ -160,7 +159,7 @@ export const LibrarySection = () => {
 						</LocationsContextMenu>
 					);
 				})}
-				{locationsQuery.data?.[SEE_MORE_LOCATIONS_COUNT - 1] && (
+				{locationsQuery.data?.[SEE_MORE_LOCATIONS_COUNT] && (
 					<div
 						onClick={() => setSeeMoreLocations(!seeMoreLocations)}
 						className="mb-1 ml-2 mt-0.5 cursor-pointer text-center text-tiny font-semibold text-ink-faint/50 transition hover:text-accent"

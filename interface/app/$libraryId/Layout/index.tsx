@@ -1,13 +1,16 @@
 import clsx from 'clsx';
-import { Suspense, useMemo, useRef } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Navigate, Outlet } from 'react-router-dom';
 import {
 	ClientContextProvider,
-	LibraryContextProvider,
 	initPlausible,
+	LibraryContextProvider,
 	useClientContext,
-	usePlausiblePageViewMonitor
+	usePlausibleEvent,
+	usePlausiblePageViewMonitor,
+	usePlausiblePingMonitor
 } from '@sd/client';
+
 import { useRootContext } from '~/app/RootContext';
 import { LibraryIdParamsSchema } from '~/app/route-schemas';
 import { useOperatingSystem, useZodRouteParams } from '~/hooks';
@@ -15,11 +18,11 @@ import { usePlatform } from '~/util/Platform';
 import { QuickPreviewContextProvider } from '../Explorer/QuickPreview/Context';
 import { LayoutContext } from './Context';
 import Sidebar from './Sidebar';
-import Toasts from './Toasts';
 
 const Layout = () => {
 	const { libraries, library } = useClientContext();
 	const os = useOperatingSystem();
+	const plausibleEvent = usePlausibleEvent();
 
 	const layoutRef = useRef<HTMLDivElement>(null);
 
@@ -30,6 +33,19 @@ const Layout = () => {
 	const { rawPath } = useRootContext();
 
 	usePlausiblePageViewMonitor({ currentPath: rawPath });
+	usePlausiblePingMonitor({ currentPath: rawPath });
+
+	useEffect(() => {
+		const interval = setInterval(() => {
+			plausibleEvent({
+				event: {
+					type: 'ping'
+				}
+			});
+		}, 270 * 1000);
+
+		return () => clearInterval(interval);
+	}, []);
 
 	const ctxValue = useMemo(() => ({ ref: layoutRef }), [layoutRef]);
 
@@ -73,7 +89,6 @@ const Layout = () => {
 						</h1>
 					)}
 				</div>
-				<Toasts />
 			</div>
 		</LayoutContext.Provider>
 	);

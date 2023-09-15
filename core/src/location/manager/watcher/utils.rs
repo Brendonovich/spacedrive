@@ -10,13 +10,17 @@ use crate::{
 			loose_find_existing_file_path_params, FilePathError, FilePathMetadata,
 			IsolatedFilePathData, MetadataExt,
 		},
-		find_location, location_with_indexer_rules,
+		find_location, generate_thumbnail, location_with_indexer_rules,
 		manager::LocationManagerError,
 		scan_location_sub_path,
 	},
 	object::{
 		file_identifier::FileMetadata,
-		preview::{can_generate_thumbnail_for_image, generate_image_thumbnail, get_thumbnail_path},
+		media::{
+			media_data_extractor::{can_extract_media_data_for_image, extract_media_data},
+			media_data_image_to_query,
+			thumbnail::get_thumbnail_path,
+		},
 		validation::hash::file_checksum,
 	},
 	prisma::{file_path, location, object},
@@ -42,7 +46,7 @@ use std::{
 	sync::Arc,
 };
 
-use sd_file_ext::extensions::ImageExtension;
+use sd_file_ext::{extensions::ImageExtension, kind::ObjectKind};
 
 use chrono::{DateTime, Local, Utc};
 use notify::Event;
@@ -50,7 +54,10 @@ use prisma_client_rust::{raw, PrismaValue};
 use sd_prisma::prisma_sync;
 use sd_sync::OperationFactory;
 use serde_json::json;
-use tokio::{fs, io::ErrorKind};
+use tokio::{
+	fs,
+	io::{self, ErrorKind},
+};
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
@@ -91,20 +98,6 @@ pub(super) async fn create_dir(
 
 	let iso_file_path = IsolatedFilePathData::new(location.id, location_path, path, true)?;
 
-	let (inode, device) = {
-		#[cfg(target_family = "unix")]
-		{
-			get_inode_and_device(metadata)?
-		}
-
-		#[cfg(target_family = "windows")]
-		{
-			// FIXME: This is a workaround for Windows, because we can't get the inode and device from the metadata
-			let _ = metadata; // To avoid unused variable warning
-			get_inode_and_device_from_path(path).await?
-		}
-	};
-
 	let parent_iso_file_path = iso_file_path.parent();
 	if !parent_iso_file_path.is_root()
 		&& !check_file_path_exists::<FilePathError>(&parent_iso_file_path, &library.db).await?
@@ -126,13 +119,7 @@ pub(super) async fn create_dir(
 		library,
 		iso_file_path,
 		None,
-		FilePathMetadata {
-			inode,
-			device,
-			size_in_bytes: metadata.len(),
-			created_at: metadata.created_or_now().into(),
-			modified_at: metadata.modified_or_now().into(),
-		},
+		FilePathMetadata::from_path(path, metadata).await?,
 	)
 	.await?;
 
@@ -184,19 +171,7 @@ async fn inner_create_file(
 	let iso_file_path = IsolatedFilePathData::new(location_id, location_path, path, false)?;
 	let extension = iso_file_path.extension.to_string();
 
-	let (inode, device) = {
-		#[cfg(target_family = "unix")]
-		{
-			get_inode_and_device(metadata)?
-		}
-
-		#[cfg(target_family = "windows")]
-		{
-			// FIXME: This is a workaround for Windows, because we can't get the inode and device from the metadata
-			let _ = metadata; // To avoid unused variable warning
-			get_inode_and_device_from_path(path).await?
-		}
-	};
+	let metadata = FilePathMetadata::from_path(path, metadata).await?;
 
 	// First we check if already exist a file with these same inode and device numbers
 	// if it does, we just update it
@@ -204,8 +179,8 @@ async fn inner_create_file(
 		.file_path()
 		.find_unique(file_path::location_id_inode_device(
 			location_id,
-			inode.to_le_bytes().to_vec(),
-			device.to_le_bytes().to_vec(),
+			metadata.inode.to_le_bytes().to_vec(),
+			metadata.device.to_le_bytes().to_vec(),
 		))
 		.include(file_path_with_object::include())
 		.exec()
@@ -240,7 +215,7 @@ async fn inner_create_file(
 			path,
 			node,
 			library,
-			Some((inode, device)),
+			Some((metadata.inode, metadata.device)),
 		)
 		.await;
 	}
@@ -262,26 +237,14 @@ async fn inner_create_file(
 
 	debug!("Creating path: {}", iso_file_path);
 
-	let created_file = create_file_path(
-		library,
-		iso_file_path,
-		Some(cas_id.clone()),
-		FilePathMetadata {
-			inode,
-			device,
-			size_in_bytes: metadata.len(),
-			created_at: metadata.created_or_now().into(),
-			modified_at: metadata.modified_or_now().into(),
-		},
-	)
-	.await?;
+	let created_file = create_file_path(library, iso_file_path, cas_id.clone(), metadata).await?;
 
 	object::select!(object_just_id { id });
 
 	let existing_object = db
 		.object()
 		.find_first(vec![object::file_paths::some(vec![
-			file_path::cas_id::equals(Some(cas_id.clone())),
+			file_path::cas_id::equals(cas_id.clone()),
 			file_path::pub_id::not(created_file.pub_id.clone()),
 		])])
 		.select(object_just_id::select())
@@ -314,14 +277,38 @@ async fn inner_create_file(
 		.exec()
 		.await?;
 
-	if !extension.is_empty() {
+	if !extension.is_empty() && matches!(kind, ObjectKind::Image | ObjectKind::Video) {
 		// Running in a detached task as thumbnail generation can take a while and we don't want to block the watcher
-		let path = path.to_path_buf();
+		let inner_path = path.to_path_buf();
 		let node = node.clone();
+		let inner_extension = extension.clone();
+		if let Some(cas_id) = cas_id {
+			tokio::spawn(async move {
+				generate_thumbnail(&inner_extension, &cas_id, inner_path, &node).await;
+			});
+		}
 
-		tokio::spawn(async move {
-			generate_thumbnail(&extension, &cas_id, path, &node).await;
-		});
+		// TODO: Currently we only extract media data for images, remove this if later
+		if matches!(kind, ObjectKind::Image) {
+			if let Ok(image_extension) = ImageExtension::from_str(&extension) {
+				if can_extract_media_data_for_image(&image_extension) {
+					if let Ok(media_data) = extract_media_data(path)
+						.await
+						.map_err(|e| error!("Failed to extract media data: {e:#?}"))
+					{
+						if let Ok(media_data_params) =
+							media_data_image_to_query(media_data, object.id).map_err(|e| {
+								error!("Failed to prepare media data create params: {e:#?}")
+							}) {
+							db.media_data()
+								.create_many(vec![media_data_params])
+								.exec()
+								.await?;
+						}
+					}
+				}
+			}
+		}
 	}
 
 	invalidate_query!(library, "search.paths");
@@ -355,6 +342,16 @@ pub(super) async fn update_file(
 	library: &Arc<Library>,
 ) -> Result<(), LocationManagerError> {
 	let full_path = full_path.as_ref();
+
+	let metadata = match fs::metadata(full_path).await {
+		Ok(metadata) => metadata,
+		Err(e) if e.kind() == io::ErrorKind::NotFound => {
+			// If the file doesn't exist anymore, it was just a temporary file
+			return Ok(());
+		}
+		Err(e) => return Err(FileIOError::from((full_path, e)).into()),
+	};
+
 	let location_path = extract_location_path(location_id, library).await?;
 
 	if let Some(ref file_path) = library
@@ -374,9 +371,7 @@ pub(super) async fn update_file(
 			location_id,
 			location_path,
 			full_path,
-			&fs::metadata(full_path)
-				.await
-				.map_err(|e| FileIOError::from((full_path, e)))?,
+			&metadata,
 			node,
 			library,
 		)
@@ -438,108 +433,115 @@ async fn inner_update_file(
 			(false, false) => (Some(inode), Some(device)),
 		};
 
-	if let Some(old_cas_id) = &file_path.cas_id {
-		if old_cas_id != &cas_id {
-			let (sync_params, db_params): (Vec<_>, Vec<_>) = {
-				use file_path::*;
+	if file_path.cas_id != cas_id {
+		let (sync_params, db_params): (Vec<_>, Vec<_>) = {
+			use file_path::*;
 
-				[
-					(
-						(cas_id::NAME, json!(old_cas_id)),
-						Some(cas_id::set(Some(old_cas_id.clone()))),
-					),
-					(
-						(
-							size_in_bytes_bytes::NAME,
-							json!(fs_metadata.len().to_be_bytes().to_vec()),
-						),
-						Some(size_in_bytes_bytes::set(Some(
-							fs_metadata.len().to_be_bytes().to_vec(),
-						))),
-					),
-					{
-						let date = DateTime::<Utc>::from(fs_metadata.modified_or_now()).into();
-
-						(
-							(date_modified::NAME, json!(date)),
-							Some(date_modified::set(Some(date))),
-						)
-					},
-					{
-						// TODO: Should this be a skip rather than a null-set?
-						let checksum = if file_path.integrity_checksum.is_some() {
-							// If a checksum was already computed, we need to recompute it
-							Some(
-								file_checksum(full_path)
-									.await
-									.map_err(|e| FileIOError::from((full_path, e)))?,
-							)
-						} else {
-							None
-						};
-
-						(
-							(integrity_checksum::NAME, json!(checksum)),
-							Some(integrity_checksum::set(checksum)),
-						)
-					},
-					{
-						if let Some(new_inode) = maybe_new_inode {
-							(
-								(inode::NAME, json!(new_inode)),
-								Some(inode::set(Some(inode_to_db(new_inode)))),
-							)
-						} else {
-							((inode::NAME, serde_json::Value::Null), None)
-						}
-					},
-					{
-						if let Some(new_device) = maybe_new_device {
-							(
-								(device::NAME, json!(new_device)),
-								Some(device::set(Some(device_to_db(new_device)))),
-							)
-						} else {
-							((device::NAME, serde_json::Value::Null), None)
-						}
-					},
-				]
-				.into_iter()
-				.filter_map(|(sync_param, maybe_db_param)| {
-					maybe_db_param.map(|db_param| (sync_param, db_param))
-				})
-				.unzip()
-			};
-
-			// file content changed
-			sync.write_ops(
-				db,
+			[
 				(
-					sync_params
-						.into_iter()
-						.map(|(field, value)| {
-							sync.shared_update(
-								prisma_sync::file_path::SyncId {
-									pub_id: file_path.pub_id.clone(),
-								},
-								field,
-								value,
-							)
-						})
-						.collect(),
-					db.file_path().update(
-						file_path::pub_id::equals(file_path.pub_id.clone()),
-						db_params,
-					),
+					(cas_id::NAME, json!(file_path.cas_id)),
+					Some(cas_id::set(file_path.cas_id.clone())),
 				),
-			)
-			.await?;
+				(
+					(
+						size_in_bytes_bytes::NAME,
+						json!(fs_metadata.len().to_be_bytes().to_vec()),
+					),
+					Some(size_in_bytes_bytes::set(Some(
+						fs_metadata.len().to_be_bytes().to_vec(),
+					))),
+				),
+				{
+					let date = DateTime::<Utc>::from(fs_metadata.modified_or_now()).into();
 
-			if let Some(ref object) = file_path.object {
+					(
+						(date_modified::NAME, json!(date)),
+						Some(date_modified::set(Some(date))),
+					)
+				},
+				{
+					// TODO: Should this be a skip rather than a null-set?
+					let checksum = if file_path.integrity_checksum.is_some() {
+						// If a checksum was already computed, we need to recompute it
+						Some(
+							file_checksum(full_path)
+								.await
+								.map_err(|e| FileIOError::from((full_path, e)))?,
+						)
+					} else {
+						None
+					};
+
+					(
+						(integrity_checksum::NAME, json!(checksum)),
+						Some(integrity_checksum::set(checksum)),
+					)
+				},
+				{
+					if let Some(new_inode) = maybe_new_inode {
+						(
+							(inode::NAME, json!(new_inode)),
+							Some(inode::set(Some(inode_to_db(new_inode)))),
+						)
+					} else {
+						((inode::NAME, serde_json::Value::Null), None)
+					}
+				},
+				{
+					if let Some(new_device) = maybe_new_device {
+						(
+							(device::NAME, json!(new_device)),
+							Some(device::set(Some(device_to_db(new_device)))),
+						)
+					} else {
+						((device::NAME, serde_json::Value::Null), None)
+					}
+				},
+			]
+			.into_iter()
+			.filter_map(|(sync_param, maybe_db_param)| {
+				maybe_db_param.map(|db_param| (sync_param, db_param))
+			})
+			.unzip()
+		};
+
+		// file content changed
+		sync.write_ops(
+			db,
+			(
+				sync_params
+					.into_iter()
+					.map(|(field, value)| {
+						sync.shared_update(
+							prisma_sync::file_path::SyncId {
+								pub_id: file_path.pub_id.clone(),
+							},
+							field,
+							value,
+						)
+					})
+					.collect(),
+				db.file_path().update(
+					file_path::pub_id::equals(file_path.pub_id.clone()),
+					db_params,
+				),
+			),
+		)
+		.await?;
+
+		if let Some(ref object) = file_path.object {
+			if let Some(old_cas_id) = &file_path.cas_id {
 				// if this file had a thumbnail previously, we update it to match the new content
 				if library.thumbnail_exists(node, old_cas_id).await? {
-					if let Some(ext) = &file_path.extension {
-						generate_thumbnail(ext, &cas_id, full_path, node).await;
+					if let Some(ext) = file_path.extension.clone() {
+						// Running in a detached task as thumbnail generation can take a while and we don't want to block the watcher
+						let inner_path = full_path.to_path_buf();
+						let inner_node = node.clone();
+						if let Some(cas_id) = cas_id {
+							tokio::spawn(async move {
+								generate_thumbnail(&ext, &cas_id, inner_path, &inner_node).await;
+							});
+						}
 
 						// remove the old thumbnail as we're generating a new one
 						let thumb_path = get_thumbnail_path(node, old_cas_id);
@@ -548,30 +550,54 @@ async fn inner_update_file(
 							.map_err(|e| FileIOError::from((thumb_path, e)))?;
 					}
 				}
-
-				let int_kind = kind as i32;
-
-				if object.kind.map(|k| k != int_kind).unwrap_or_default() {
-					sync.write_op(
-						db,
-						sync.shared_update(
-							prisma_sync::object::SyncId {
-								pub_id: object.pub_id.clone(),
-							},
-							object::kind::NAME,
-							json!(int_kind),
-						),
-						db.object().update(
-							object::id::equals(object.id),
-							vec![object::kind::set(Some(int_kind))],
-						),
-					)
-					.await?;
-				}
 			}
 
-			invalidate_query!(library, "search.paths");
+			let int_kind = kind as i32;
+
+			if object.kind.map(|k| k != int_kind).unwrap_or_default() {
+				sync.write_op(
+					db,
+					sync.shared_update(
+						prisma_sync::object::SyncId {
+							pub_id: object.pub_id.clone(),
+						},
+						object::kind::NAME,
+						json!(int_kind),
+					),
+					db.object().update(
+						object::id::equals(object.id),
+						vec![object::kind::set(Some(int_kind))],
+					),
+				)
+				.await?;
+			}
+
+			// TODO: Change this if to include ObjectKind::Video in the future
+			if let Some(ext) = &file_path.extension {
+				if let Ok(image_extension) = ImageExtension::from_str(ext) {
+					if can_extract_media_data_for_image(&image_extension)
+						&& matches!(kind, ObjectKind::Image)
+					{
+						if let Ok(media_data) = extract_media_data(full_path)
+							.await
+							.map_err(|e| error!("Failed to extract media data: {e:#?}"))
+						{
+							if let Ok(media_data_params) =
+								media_data_image_to_query(media_data, object.id).map_err(|e| {
+									error!("Failed to prepare media data create params: {e:#?}")
+								}) {
+								db.media_data()
+									.create_many(vec![media_data_params])
+									.exec()
+									.await?;
+							}
+						}
+					}
+				}
+			}
 		}
+
+		invalidate_query!(library, "search.paths");
 	}
 
 	Ok(())
@@ -643,6 +669,8 @@ pub(super) async fn rename(
 			trace!("Updated {updated} file_paths");
 		}
 
+		let metadata = FilePathMetadata::from_path(new_path, &new_path_metadata).await?;
+
 		library
 			.db
 			.file_path()
@@ -655,6 +683,7 @@ pub(super) async fn rename(
 					file_path::date_modified::set(Some(
 						DateTime::<Utc>::from(new_path_metadata.modified_or_now()).into(),
 					)),
+					file_path::hidden::set(Some(metadata.hidden)),
 				],
 			)
 			.exec()
@@ -675,14 +704,18 @@ pub(super) async fn remove(
 	let location_path = extract_location_path(location_id, library).await?;
 
 	// if it doesn't exist either way, then we don't care
-	let Some(file_path) = library.db
+	let Some(file_path) = library
+		.db
 		.file_path()
 		.find_first(loose_find_existing_file_path_params(
-		location_id, &location_path, full_path,
+			location_id,
+			&location_path,
+			full_path,
 		)?)
 		.exec()
-		.await? else {
-			return Ok(());
+		.await?
+	else {
+		return Ok(());
 	};
 
 	remove_by_file_path(location_id, full_path, &file_path, library).await
@@ -736,53 +769,6 @@ pub(super) async fn remove_by_file_path(
 	invalidate_query!(library, "search.paths");
 
 	Ok(())
-}
-
-async fn generate_thumbnail(
-	extension: &str,
-	cas_id: &str,
-	path: impl AsRef<Path>,
-	node: &Arc<Node>,
-) {
-	let path = path.as_ref();
-	let output_path = get_thumbnail_path(node, cas_id);
-
-	if let Err(e) = fs::metadata(&output_path).await {
-		if e.kind() != ErrorKind::NotFound {
-			error!(
-				"Failed to check if thumbnail exists, but we will try to generate it anyway: {e}"
-			);
-		}
-	// Otherwise we good, thumbnail doesn't exist so we can generate it
-	} else {
-		debug!(
-			"Skipping thumbnail generation for {} because it already exists",
-			path.display()
-		);
-		return;
-	}
-
-	if let Ok(extension) = ImageExtension::from_str(extension) {
-		if can_generate_thumbnail_for_image(&extension) {
-			if let Err(e) = generate_image_thumbnail(path, &output_path).await {
-				error!("Failed to image thumbnail on location manager: {e:#?}");
-			}
-		}
-	}
-
-	#[cfg(feature = "ffmpeg")]
-	{
-		use crate::object::preview::{can_generate_thumbnail_for_video, generate_video_thumbnail};
-		use sd_file_ext::extensions::VideoExtension;
-
-		if let Ok(extension) = VideoExtension::from_str(extension) {
-			if can_generate_thumbnail_for_video(&extension) {
-				if let Err(e) = generate_video_thumbnail(path, &output_path).await {
-					error!("Failed to video thumbnail on location manager: {e:#?}");
-				}
-			}
-		}
-	}
 }
 
 pub(super) async fn extract_inode_and_device_from_path(

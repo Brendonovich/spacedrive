@@ -1,7 +1,6 @@
 use crate::{
 	location::file_path_helper::{
 		file_path_pub_and_cas_ids, file_path_walker, FilePathMetadata, IsolatedFilePathData,
-		MetadataExt,
 	},
 	prisma::file_path,
 	util::{
@@ -9,12 +8,6 @@ use crate::{
 		error::FileIOError,
 	},
 };
-
-#[cfg(target_family = "unix")]
-use crate::location::file_path_helper::get_inode_and_device;
-
-#[cfg(target_family = "windows")]
-use crate::location::file_path_helper::get_inode_and_device_from_path;
 
 use std::{
 	collections::{HashMap, HashSet, VecDeque},
@@ -280,27 +273,9 @@ where
 			.await
 			.map_err(|e| FileIOError::from((root, e)))?;
 
-		let (inode, device) = {
-			#[cfg(target_family = "unix")]
-			{
-				get_inode_and_device(&metadata)
-			}
-
-			#[cfg(target_family = "windows")]
-			{
-				get_inode_and_device_from_path(&root).await
-			}
-		}?;
-
 		indexed_paths.insert(WalkingEntry {
 			iso_file_path: iso_file_path_factory(root, true)?,
-			maybe_metadata: Some(FilePathMetadata {
-				inode,
-				device,
-				size_in_bytes: metadata.len(),
-				created_at: metadata.created_or_now().into(),
-				modified_at: metadata.modified_or_now().into(),
-			}),
+			maybe_metadata: Some(FilePathMetadata::from_path(root, &metadata).await?),
 		});
 	}
 
@@ -441,9 +416,10 @@ where
 		return vec![];
 	};
 
-	let Ok(mut read_dir) = fs::read_dir(path).await
+	let Ok(mut read_dir) = fs::read_dir(path)
+		.await
 		.map_err(|e| errors.push(FileIOError::from((path.clone(), e)).into()))
-		else {
+	else {
 		return vec![];
 	};
 
@@ -490,9 +466,10 @@ where
 			accept_by_children_dir
 		);
 
-		let Ok(rules_per_kind) = IndexerRule::apply_all(indexer_rules, &current_path).await
+		let Ok(rules_per_kind) = IndexerRule::apply_all(indexer_rules, &current_path)
+			.await
 			.map_err(|e| errors.push(e.into()))
-			else {
+		else {
 			continue 'entries;
 		};
 
@@ -512,8 +489,8 @@ where
 			.metadata()
 			.await
 			.map_err(|e| errors.push(FileIOError::from((entry.path(), e)).into()))
-			else {
-				continue 'entries;
+		else {
+			continue 'entries;
 		};
 
 		// TODO: Hard ignoring symlinks for now, but this should be configurable
@@ -522,21 +499,6 @@ where
 		}
 
 		let is_dir = metadata.is_dir();
-
-		let Ok((inode, device)) = {
-			#[cfg(target_family = "unix")]
-			{
-				get_inode_and_device(&metadata)
-			}
-
-			#[cfg(target_family = "windows")]
-			{
-				get_inode_and_device_from_path(&current_path).await
-			}
-		}.map_err(|e| errors.push(e.into()))
-		else {
-			continue 'entries;
-		};
 
 		if is_dir {
 			// If it is a directory, first we check if we must reject it and its children entirely
@@ -592,21 +554,22 @@ where
 		}
 
 		if accept_by_children_dir.unwrap_or(true) {
-			let Ok(iso_file_path) = iso_file_path_factory(&current_path, is_dir)
-				.map_err(|e| errors.push(e))
-				else {
-					continue 'entries;
+			let Ok(iso_file_path) =
+				iso_file_path_factory(&current_path, is_dir).map_err(|e| errors.push(e))
+			else {
+				continue 'entries;
+			};
+
+			let Ok(metadata) = FilePathMetadata::from_path(&current_path, &metadata)
+				.await
+				.map_err(|e| errors.push(e.into()))
+			else {
+				continue;
 			};
 
 			paths_buffer.push(WalkingEntry {
 				iso_file_path,
-				maybe_metadata: Some(FilePathMetadata {
-					inode,
-					device,
-					size_in_bytes: metadata.len(),
-					created_at: metadata.created_or_now().into(),
-					modified_at: metadata.modified_or_now().into(),
-				}),
+				maybe_metadata: Some(metadata),
 			});
 
 			// If the ancestors directories wasn't indexed before, now we do
@@ -615,11 +578,11 @@ where
 				.skip(1) // Skip the current directory as it was already indexed
 				.take_while(|&ancestor| ancestor != root)
 			{
-				let Ok(iso_file_path) = iso_file_path_factory(ancestor, true)
-					.map_err(|e| errors.push(e))
-					else {
-						// Checking the next ancestor, as this one we got an error
-						continue;
+				let Ok(iso_file_path) =
+					iso_file_path_factory(ancestor, true).map_err(|e| errors.push(e))
+				else {
+					// Checking the next ancestor, as this one we got an error
+					continue;
 				};
 
 				let mut ancestor_iso_walking_entry = WalkingEntry {
@@ -631,32 +594,19 @@ where
 					let Ok(metadata) = fs::metadata(ancestor)
 						.await
 						.map_err(|e| errors.push(FileIOError::from((&ancestor, e)).into()))
-						else {
-							// Checking the next ancestor, as this one we got an error
-							continue;
-					};
-					let Ok((inode, device)) = {
-						#[cfg(target_family = "unix")]
-						{
-							get_inode_and_device(&metadata)
-						}
-
-						#[cfg(target_family = "windows")]
-						{
-							get_inode_and_device_from_path(ancestor).await
-						}
-					}.map_err(|e| errors.push(e.into())) else {
+					else {
 						// Checking the next ancestor, as this one we got an error
 						continue;
 					};
 
-					ancestor_iso_walking_entry.maybe_metadata = Some(FilePathMetadata {
-						inode,
-						device,
-						size_in_bytes: metadata.len(),
-						created_at: metadata.created_or_now().into(),
-						modified_at: metadata.modified_or_now().into(),
-					});
+					let Ok(metadata) = FilePathMetadata::from_path(ancestor, &metadata)
+						.await
+						.map_err(|e| errors.push(e.into()))
+					else {
+						continue;
+					};
+
+					ancestor_iso_walking_entry.maybe_metadata = Some(metadata);
 
 					paths_buffer.push(ancestor_iso_walking_entry);
 				} else {
@@ -785,6 +735,7 @@ mod tests {
 			size_in_bytes: 0,
 			created_at: Utc::now(),
 			modified_at: Utc::now(),
+			hidden: false,
 		};
 
 		let f = |path, is_dir| IsolatedFilePathData::new(0, root_path, path, is_dir).unwrap();
@@ -855,6 +806,7 @@ mod tests {
 			size_in_bytes: 0,
 			created_at: Utc::now(),
 			modified_at: Utc::now(),
+			hidden: false,
 		};
 
 		let f = |path, is_dir| IsolatedFilePathData::new(0, root_path, path, is_dir).unwrap();
@@ -919,6 +871,7 @@ mod tests {
 			size_in_bytes: 0,
 			created_at: Utc::now(),
 			modified_at: Utc::now(),
+			hidden: false,
 		};
 
 		let f = |path, is_dir| IsolatedFilePathData::new(0, root_path, path, is_dir).unwrap();
@@ -992,6 +945,7 @@ mod tests {
 			size_in_bytes: 0,
 			created_at: Utc::now(),
 			modified_at: Utc::now(),
+			hidden: false,
 		};
 
 		let f = |path, is_dir| IsolatedFilePathData::new(0, root_path, path, is_dir).unwrap();

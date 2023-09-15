@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use tracing::error;
 use uuid::Uuid;
 
 use super::*;
@@ -31,9 +32,15 @@ impl LibraryPreferences {
 		let prefs = PreferenceKVs::new(
 			kvs.into_iter()
 				.filter_map(|data| {
-					let a = rmpv::decode::read_value(&mut data.value?.as_slice()).unwrap();
-
-					Some((PreferenceKey::new(data.key), PreferenceValue::from_value(a)))
+					rmpv::decode::read_value(&mut data.value?.as_slice())
+						.map_err(|e| error!("{e:#?}"))
+						.ok()
+						.map(|value| {
+							(
+								PreferenceKey::new(data.key),
+								PreferenceValue::from_value(value),
+							)
+						})
 				})
 				.collect(),
 		);
@@ -45,7 +52,7 @@ impl LibraryPreferences {
 #[derive(Clone, Serialize, Deserialize, Type, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct LocationSettings {
-	explorer: ExplorerSettings<search::FilePathSearchOrdering>,
+	explorer: ExplorerSettings<search::FilePathOrder>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Type, Debug)]
@@ -61,6 +68,8 @@ pub struct ExplorerSettings<TOrder> {
 	// temporary
 	#[serde(skip_serializing_if = "Option::is_none")]
 	order: Option<Option<TOrder>>,
+	#[serde(default)]
+	show_hidden_files: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Type, Debug)]

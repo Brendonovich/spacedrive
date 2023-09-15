@@ -14,8 +14,8 @@ use std::{
 };
 
 use async_channel as chan;
-use futures::{stream::FuturesUnordered, FutureExt};
-use futures_concurrency::{future::TryJoin, stream::Merge};
+use futures::{future::try_join_all, stream::FuturesUnordered, FutureExt};
+use futures_concurrency::stream::Merge;
 use thiserror::Error;
 use tokio::{
 	fs, io,
@@ -26,7 +26,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
-use super::preview::THUMBNAIL_CACHE_DIR_NAME;
+use super::media::thumbnail::THUMBNAIL_CACHE_DIR_NAME;
 
 const THIRTY_SECS: Duration = Duration::from_secs(30);
 const HALF_HOUR: Duration = Duration::from_secs(30 * 60);
@@ -216,23 +216,19 @@ impl Actor {
 		thumbnails_directory: &Path,
 		cas_ids: Vec<String>,
 	) -> Result<(), Error> {
-		cas_ids
-			.into_iter()
-			.map(|cas_id| async move {
-				let thumbnail_path =
-					thumbnails_directory.join(format!("{}/{}.webp", &cas_id[0..2], &cas_id[2..]));
+		try_join_all(cas_ids.into_iter().map(|cas_id| async move {
+			let thumbnail_path =
+				thumbnails_directory.join(format!("{}/{}.webp", &cas_id[0..2], &cas_id[2..]));
 
-				trace!("Removing thumbnail: {}", thumbnail_path.display());
+			trace!("Removing thumbnail: {}", thumbnail_path.display());
 
-				match fs::remove_file(&thumbnail_path).await {
-					Ok(()) => Ok(()),
-					Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-					Err(e) => Err(FileIOError::from((thumbnail_path, e))),
-				}
-			})
-			.collect::<Vec<_>>()
-			.try_join()
-			.await?;
+			match fs::remove_file(&thumbnail_path).await {
+				Ok(()) => Ok(()),
+				Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+				Err(e) => Err(FileIOError::from((thumbnail_path, e))),
+			}
+		}))
+		.await?;
 
 		Ok(())
 	}
@@ -250,6 +246,9 @@ impl Actor {
 		//└── <cas_id>[0..2]/ # sharding
 		//    └── <cas_id>.webp
 
+		fs::create_dir_all(&thumbnails_directory)
+			.await
+			.map_err(|e| FileIOError::from((thumbnails_directory, e)))?;
 		let mut read_dir = fs::read_dir(thumbnails_directory)
 			.await
 			.map_err(|e| FileIOError::from((thumbnails_directory, e)))?;
@@ -339,17 +338,17 @@ impl Actor {
 
 			let thumbs_to_remove = thumbnails_paths_by_cas_id.len();
 
-			thumbnails_paths_by_cas_id
-				.into_values()
-				.map(|path| async move {
-					trace!("Removing stale thumbnail: {}", path.display());
-					fs::remove_file(&path)
-						.await
-						.map_err(|e| FileIOError::from((path, e)))
-				})
-				.collect::<Vec<_>>()
-				.try_join()
-				.await?;
+			try_join_all(
+				thumbnails_paths_by_cas_id
+					.into_values()
+					.map(|path| async move {
+						trace!("Removing stale thumbnail: {}", path.display());
+						fs::remove_file(&path)
+							.await
+							.map_err(|e| FileIOError::from((path, e)))
+					}),
+			)
+			.await?;
 
 			if thumbs_to_remove == thumbs_found {
 				// if we removed all the thumnails we foumd, it means that the directory is empty

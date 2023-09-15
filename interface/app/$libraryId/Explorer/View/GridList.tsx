@@ -1,18 +1,28 @@
-import { ReactNode, createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import {
+	createContext,
+	useCallback,
+	useContext,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+	type ReactNode
+} from 'react';
 import Selecto from 'react-selecto';
 import { useKey } from 'rooks';
-import { ExplorerItem } from '@sd/client';
+import { type ExplorerItem } from '@sd/client';
 import { GridList, useGridList } from '~/components';
 import { useOperatingSystem } from '~/hooks';
+
 import { useExplorerContext } from '../Context';
-import { useExplorerViewContext } from '../ViewContext';
+import { getQuickPreviewStore } from '../QuickPreview/store';
 import { getExplorerStore, isCut, useExplorerStore } from '../store';
-import { ExplorerItemHash } from '../useExplorer';
-import { explorerItemHash } from '../util';
+import { uniqueId } from '../util';
+import { useExplorerViewContext } from '../ViewContext';
 
 const SelectoContext = createContext<{
 	selecto: React.RefObject<Selecto>;
-	selectoUnSelected: React.MutableRefObject<Set<ExplorerItemHash>>;
+	selectoUnSelected: React.MutableRefObject<Set<string>>;
 } | null>(null);
 
 type RenderItem = (item: { item: ExplorerItem; selected: boolean; cut: boolean }) => ReactNode;
@@ -24,11 +34,12 @@ const GridListItem = (props: {
 	onMouseDown: (e: React.MouseEvent<HTMLDivElement, MouseEvent>) => void;
 }) => {
 	const explorer = useExplorerContext();
+	const explorerStore = useExplorerStore();
 	const explorerView = useExplorerViewContext();
 
 	const selecto = useContext(SelectoContext);
 
-	const cut = isCut(props.item.item.id);
+	const cut = isCut(props.item, explorerStore.cutCopyState);
 
 	const selected = useMemo(
 		// Even though this checks object equality, it should still be safe since `selectedItems`
@@ -37,21 +48,21 @@ const GridListItem = (props: {
 		[explorer.selectedItems, props.item]
 	);
 
-	const hash = explorerItemHash(props.item);
+	const itemId = uniqueId(props.item);
 
 	useEffect(() => {
-		if (!selecto?.selecto.current || !selecto.selectoUnSelected.current.has(hash)) return;
+		if (!selecto?.selecto.current || !selecto.selectoUnSelected.current.has(itemId)) return;
 
 		if (!selected) {
-			selecto.selectoUnSelected.current.delete(hash);
+			selecto.selectoUnSelected.current.delete(itemId);
 			return;
 		}
 
-		const element = document.querySelector(`[data-selectable-id="${hash}"]`);
+		const element = document.querySelector(`[data-selectable-id="${itemId}"]`);
 
 		if (!element) return;
 
-		selecto.selectoUnSelected.current.delete(hash);
+		selecto.selectoUnSelected.current.delete(itemId);
 		selecto.selecto.current.setSelectedTargets([
 			...selecto.selecto.current.getSelectedTargets(),
 			element as HTMLElement
@@ -64,8 +75,8 @@ const GridListItem = (props: {
 		if (!selecto) return;
 
 		return () => {
-			const element = document.querySelector(`[data-selectable-id="${hash}"]`);
-			if (selected && !element) selecto.selectoUnSelected.current.add(hash);
+			const element = document.querySelector(`[data-selectable-id="${itemId}"]`);
+			if (selected && !element) selecto.selectoUnSelected.current.add(itemId);
 		};
 
 		// eslint-disable-next-line react-hooks/exhaustive-deps
@@ -76,7 +87,7 @@ const GridListItem = (props: {
 			className="h-full w-full"
 			data-selectable=""
 			data-selectable-index={props.index}
-			data-selectable-id={hash}
+			data-selectable-id={itemId}
 			onMouseDown={props.onMouseDown}
 			onContextMenu={(e) => {
 				if (explorerView.selectable && !explorer.selectedItems.has(props.item)) {
@@ -103,7 +114,7 @@ export default ({ children }: { children: RenderItem }) => {
 	const explorerView = useExplorerViewContext();
 
 	const selecto = useRef<Selecto>(null);
-	const selectoUnSelected = useRef<Set<ExplorerItemHash>>(new Set());
+	const selectoUnSelected = useRef<Set<string>>(new Set());
 	const selectoFirstColumn = useRef<number | undefined>();
 	const selectoLastColumn = useRef<number | undefined>();
 
@@ -115,19 +126,22 @@ export default ({ children }: { children: RenderItem }) => {
 	const grid = useGridList({
 		ref: explorerView.ref,
 		count: explorer.items?.length ?? 0,
+		totalCount: explorer.count,
 		overscan: explorer.overscan,
 		onLoadMore: explorer.loadMore,
-		rowsBeforeLoadMore: explorer.rowsBeforeLoadMore,
 		size:
 			settings.layoutMode === 'grid'
 				? { width: settings.gridItemSize, height: itemHeight }
 				: undefined,
 		columns: settings.layoutMode === 'media' ? settings.mediaColumns : undefined,
-		getItemId: (index) => {
-			const item = explorer.items?.[index];
-			return item ? explorerItemHash(item) : undefined;
-		},
-		getItemData: (index) => explorer.items?.[index],
+		getItemId: useCallback(
+			(index: number) => {
+				const item = explorer.items?.[index];
+				return item ? uniqueId(item) : undefined;
+			},
+			[explorer.items]
+		),
+		getItemData: useCallback((index: number) => explorer.items?.[index], [explorer.items]),
 		padding: explorerView.padding || settings.layoutMode === 'grid' ? 12 : undefined,
 		gap:
 			explorerView.gap ||
@@ -136,7 +150,7 @@ export default ({ children }: { children: RenderItem }) => {
 	});
 
 	function getElementId(element: Element) {
-		return element.getAttribute('data-selectable-id') as ExplorerItemHash | null;
+		return element.getAttribute('data-selectable-id');
 	}
 
 	function getElementIndex(element: Element) {
@@ -149,6 +163,25 @@ export default ({ children }: { children: RenderItem }) => {
 		if (index === null) return null;
 
 		return grid.getItem(index) ?? null;
+	}
+
+	function getActiveItem(elements: Element[]) {
+		// Get selected item with least index.
+		// Might seem kinda weird but it's the same behaviour as Finder.
+		const activeItem =
+			elements.reduce(
+				(least, current) => {
+					const currentItem = getElementItem(current);
+					if (!currentItem) return least;
+
+					if (!least) return currentItem;
+
+					return currentItem.index < least.index ? currentItem : least;
+				},
+				null as ReturnType<typeof getElementItem>
+			)?.data ?? null;
+
+		return activeItem;
 	}
 
 	useEffect(
@@ -187,6 +220,8 @@ export default ({ children }: { children: RenderItem }) => {
 		selectoUnSelected.current = set;
 		selecto.current.setSelectedTargets(items as HTMLElement[]);
 
+		activeItem.current = getActiveItem(items);
+
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [grid.columnCount, explorer.items]);
 
@@ -204,10 +239,16 @@ export default ({ children }: { children: RenderItem }) => {
 		activeItem.current = null;
 	}, [explorer.selectedItems]);
 
-	useKey(['ArrowUp', 'ArrowDown', 'ArrowRight', 'ArrowLeft'], (e) => {
-		if (explorer.selectedItems.size > 0) e.preventDefault();
-
+	useKey(['ArrowUp', 'ArrowDown', 'ArrowRight', 'ArrowLeft', 'Escape'], (e) => {
 		if (!explorerView.selectable) return;
+
+		if (e.key === 'Escape') {
+			explorer.resetSelectedItems([]);
+			selecto.current?.setSelectedTargets([]);
+			return;
+		}
+
+		if (explorer.selectedItems.size > 0) e.preventDefault();
 
 		const lastItem = activeItem.current;
 		if (!lastItem) return;
@@ -244,12 +285,12 @@ export default ({ children }: { children: RenderItem }) => {
 		if (!explorer.allowMultiSelect) explorer.resetSelectedItems([newSelectedItem.data]);
 		else {
 			const selectedItemDom = document.querySelector(
-				`[data-selectable-id="${explorerItemHash(newSelectedItem.data)}"]`
+				`[data-selectable-id="${uniqueId(newSelectedItem.data)}"]`
 			);
 
 			if (!selectedItemDom) return;
 
-			if (e.shiftKey) {
+			if (e.shiftKey && !getQuickPreviewStore().open) {
 				if (!explorer.selectedItems.has(newSelectedItem.data)) {
 					explorer.addSelectedItem(newSelectedItem.data);
 					selecto.current?.setSelectedTargets([
@@ -336,18 +377,7 @@ export default ({ children }: { children: RenderItem }) => {
 						setDragFromThumbnail(false);
 
 						const allSelected = selecto.current?.getSelectedTargets() ?? [];
-
-						// Sets active item to selected item with least index.
-						// Might seem kinda weird but it's the same behaviour as Finder.
-						activeItem.current =
-							allSelected.reduce((least, current) => {
-								const currentItem = getElementItem(current);
-								if (!currentItem) return least;
-
-								if (!least) return currentItem;
-
-								return currentItem.index < least.index ? currentItem : least;
-							}, null as ReturnType<typeof getElementItem>)?.data ?? null;
+						activeItem.current = getActiveItem(allSelected);
 					}}
 					onScroll={({ direction }) => {
 						selecto.current?.findSelectableTargets();
@@ -388,7 +418,7 @@ export default ({ children }: { children: RenderItem }) => {
 							if (e.added[0]) explorer.addSelectedItem(item.data);
 							else explorer.removeSelectedItem(item.data);
 						} else if (inputEvent.type === 'mousemove') {
-							const unselectedItems: ExplorerItemHash[] = [];
+							const unselectedItems: string[] = [];
 
 							e.added.forEach((el) => {
 								const item = getElementItem(el);
@@ -423,14 +453,17 @@ export default ({ children }: { children: RenderItem }) => {
 
 							const elements = [...e.added, ...e.removed];
 
-							const items = elements.reduce((items, el) => {
-								const item = getElementItem(el);
+							const items = elements.reduce(
+								(items, el) => {
+									const item = getElementItem(el);
 
-								if (!item) return items;
+									if (!item) return items;
 
-								columns.add(item.column);
-								return [...items, item];
-							}, [] as NonNullable<ReturnType<typeof getElementItem>>[]);
+									columns.add(item.column);
+									return [...items, item];
+								},
+								[] as NonNullable<ReturnType<typeof getElementItem>>[]
+							);
 
 							if (columns.size > 1) {
 								items.sort((a, b) => a.column - b.column);
@@ -522,7 +555,7 @@ export default ({ children }: { children: RenderItem }) => {
 															explorer.addSelectedItem(item);
 															if (inDragArea)
 																unselectedItems.push(
-																	explorerItemHash(item)
+																	uniqueId(item)
 																);
 														}
 													} else if (!inDragArea)
@@ -530,9 +563,7 @@ export default ({ children }: { children: RenderItem }) => {
 													else {
 														explorer.addSelectedItem(item);
 														if (inDragArea)
-															unselectedItems.push(
-																explorerItemHash(item)
-															);
+															unselectedItems.push(uniqueId(item));
 													}
 												}
 											});
