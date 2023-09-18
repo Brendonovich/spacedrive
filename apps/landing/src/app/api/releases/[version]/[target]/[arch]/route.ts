@@ -25,15 +25,11 @@ type TauriResponse = {
 export const runtime = 'edge';
 
 export async function GET(req: Request, extra: { params: Record<string, unknown> }) {
-	// handles old /api/releases/[target]/[arch]/[currentVersion] requests
-	// should be removed once stable release is out
-	if (tauriArch.safeParse(extra.params['target']).success) {
-		return NextResponse.redirect(
-			new URL(`/api/releases/alpha/${extra.params.version}/${extra.params.target}`, req.url)
-		);
-	}
+	const version = req.headers.get("X-Spacedrive-Version");
 
-	const params = await paramsSchema.parseAsync(extra.params);
+	if(version === null) return NextResponse.json({ error: "No version header" }, { status: 400 })
+
+	const params = await paramsSchema.parseAsync({...extra.params, version});
 
 	const release = await getRelease(params);
 
